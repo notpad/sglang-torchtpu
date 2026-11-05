@@ -665,7 +665,12 @@ class KVCacheConfigurator:
         # pool must be sized by that space.
         draft_virtual_id_space: Optional[int] = None
         if self.is_draft_worker and token_to_kv_pool_allocator is not None:
-            if isinstance(
+            if hasattr(token_to_kv_pool_allocator, "derive_draft_pool_sizes"):
+                sizes = msgspec.structs.replace(
+                    sizes,
+                    **token_to_kv_pool_allocator.derive_draft_pool_sizes(self, sizes),
+                )
+            elif isinstance(
                 token_to_kv_pool_allocator,
                 (
                     UnifiedMambaTokenToKVPoolAllocator,
@@ -2552,6 +2557,12 @@ class KVCacheConfigurator:
 
         else:
             assert self.is_draft_worker
+            if hasattr(token_to_kv_pool_allocator, "attach_draft_kv_pool"):
+                token_to_kv_pool_allocator.attach_draft_kv_pool(
+                    token_to_kv_pool,
+                    draft_swa_full_capacity=self.draft_swa_full_capacity,
+                )
+                return token_to_kv_pool_allocator
             if self.is_hybrid_swa and (
                 not isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
                 or token_to_kv_pool.needs_paged_swa_allocator

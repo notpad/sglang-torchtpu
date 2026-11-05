@@ -96,7 +96,8 @@ class KVFreeFence:
 
     def attach(self, allocator: TpuPagedTokenToKVPoolAllocator) -> None:
         allocator.kv_free_fence = self
-        self._allocators.append(allocator)
+        if allocator not in self._allocators:
+            self._allocators.append(allocator)
 
     @property
     def in_forward_write_target(self) -> bool:
@@ -355,9 +356,10 @@ def _page_pools(
 ) -> List[BaseTokenToKVPoolAllocator]:
     from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 
+    extra = list(getattr(allocator, "extra_fence_page_pools", lambda: ())())
     if isinstance(allocator, SWATokenToKVPoolAllocator):
-        return [allocator.full_attn_allocator, allocator.swa_attn_allocator]
-    return [allocator]
+        return [allocator.full_attn_allocator, allocator.swa_attn_allocator, *extra]
+    return [allocator, *extra]
 
 
 def kv_free_fence_unsupported_reason(

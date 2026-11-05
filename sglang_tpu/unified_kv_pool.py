@@ -14,7 +14,7 @@ import inspect
 import logging
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import KVCache
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.pool_configurator import (
     MemoryPoolConfig,
     MemoryPoolConfigurator,
@@ -57,6 +58,38 @@ def num_swa_groups(num_full_layers: int, num_swa_layers: int) -> int:
             f"SWA ({num_swa_layers}) layer counts."
         )
     return _cdiv(num_swa_layers, num_full_layers)
+
+
+def _align_pages_up(num_pages: int, align: int = 8) -> int:
+    if num_pages <= 0:
+        return 0
+    return _cdiv(num_pages, align) * align
+
+
+def draft_case2b_num_pages(
+    target_pages: int,
+    target_swa_groups: int,
+    draft_swa_groups: int,
+    *,
+    align_pages: int = 8,
+) -> int:
+    """Return physical page count ``N_D`` for a unified mixed FA+SWA draft pool."""
+    if draft_swa_groups <= target_swa_groups:
+        return target_pages
+    max_live_swa = max(1, _cdiv(target_pages, 1 + target_swa_groups))
+    overflow_pages = (draft_swa_groups - target_swa_groups) * max_live_swa
+    return _align_pages_up(target_pages + overflow_pages, align_pages)
+
+
+def draft_case2c_swa_num_pages(
+    target_pages: int,
+    target_swa_groups: int,
+    *,
+    align_pages: int = 8,
+) -> int:
+    """Return compact physical SWA page count ``N_D`` for an SWA-only (or split) draft pool."""
+    max_live_swa = max(align_pages, _cdiv(target_pages, 1 + target_swa_groups))
+    return _align_pages_up(max_live_swa, align_pages)
 
 
 def _window_tokens(sliding_window_size: Optional[int], page_size: int) -> int:
@@ -174,6 +207,51 @@ def _mxint8_unified_bytes_per_token(kvc, layout: UnifiedPageLayout) -> int:
     )
 
 
+def _is_supported_spec_algorithm(spec_algorithm) -> bool:
+    if spec_algorithm.is_none():
+        return True
+    if getattr(spec_algorithm, "is_ngram", lambda: False)():
+        return True
+    if spec_algorithm.is_eagle() and not getattr(
+        spec_algorithm, "is_frozen_kv_mtp", lambda: False
+    )():
+        return True
+    if spec_algorithm.is_standalone() or spec_algorithm.is_dflash_family():
+        return True
+    return False
+
+
+def _has_draft_kv_pool(spec_algorithm) -> bool:
+    return not spec_algorithm.is_none() and not getattr(
+        spec_algorithm, "is_ngram", lambda: False
+    )()
+
+
+def _draft_unified_layout_or_none(kvc) -> Optional[UnifiedPageLayout]:
+    if not getattr(kvc, "is_hybrid_swa", False) or getattr(
+        kvc, "draft_swa_full_capacity", False
+    ):
+        return None
+    full_ids = getattr(kvc.layer_info, "full_attention_layer_ids", None) or ()
+    swa_ids = getattr(kvc.layer_info, "swa_attention_layer_ids", None) or ()
+    if len(full_ids) <= 0 or len(swa_ids) <= 0:
+        return None
+    pool_cls = kvc._tpu_mha_pool_class()
+    if not (
+        isinstance(pool_cls, type) and issubclass(pool_cls, TpuFusedMHATokenToKVPool)
+    ):
+        return None
+    if kvc.use_mla_backend or kvc.model_config.has_asymmetric_kv:
+        return None
+    try:
+        layout = _kvc_unified_layout(kvc)
+        if kvc.kv_cache_dtype_str == "mxint8":
+            _mxint8_unified_bytes_per_token(kvc, layout)
+        return layout
+    except (ValueError, NotImplementedError):
+        return None
+
+
 def _unsupported_reason(kvc) -> Optional[str]:
     """Return a human-readable reason why ``kvc`` cannot use the TPU unified KV pool,
     or ``None`` when supported."""
@@ -183,6 +261,8 @@ def _unsupported_reason(kvc) -> Optional[str]:
     disagg_mode = disagg.disaggregation_mode
     disagg_backend = getattr(disagg, "disaggregation_transfer_backend", None)
     pool_cls = kvc._tpu_mha_pool_class()
+    spec_algo = kvc.spec_algorithm
+    has_draft_kv = _has_draft_kv_pool(spec_algo)
     checks = (
         (not kvc.is_hybrid_swa, "requires a hybrid SWA model."),
         (kvc.use_mla_backend, "does not support MLA models."),
@@ -197,8 +277,20 @@ def _unsupported_reason(kvc) -> Optional[str]:
             "does not support hybrid linear-attention or Mamba models.",
         ),
         (
-            kvc.is_draft_worker or not kvc.spec_algorithm.is_none(),
-            "does not support speculative decoding.",
+            kvc.is_draft_worker,
+            "target unified pool configurator cannot be used directly on a draft worker.",
+        ),
+        (
+            not _is_supported_spec_algorithm(spec_algo),
+            f"does not support speculative_algorithm={getattr(spec_algo, 'name', spec_algo)!r}.",
+        ),
+        (
+            has_draft_kv and disagg_mode != "null",
+            "with speculative decoding does not support PD disaggregation yet.",
+        ),
+        (
+            has_draft_kv and memory.enable_hierarchical_cache,
+            "with speculative decoding does not support --enable-hierarchical-cache yet.",
         ),
         (
             parallel.pp_size > 1 or kvc.pp_size > 1,
@@ -324,6 +416,15 @@ def unified_kv_pool_requested(server_args=None) -> bool:
 
 def unified_kv_pool_enabled(kvc) -> bool:
     """Return True if ``--enable-unified-memory`` is active and validate ``kvc``."""
+    if getattr(kvc, "is_draft_worker", False):
+        alloc = getattr(kvc, "token_to_kv_pool_allocator", None)
+        if alloc is not None:
+            if not isinstance(alloc, TpuUnifiedSWATokenToKVPoolAllocator):
+                return False
+            return _draft_unified_layout_or_none(kvc) is not None
+        if not unified_kv_pool_requested(getattr(kvc, "server_args", None)):
+            return False
+        return _draft_unified_layout_or_none(kvc) is not None
     if not unified_kv_pool_requested(getattr(kvc, "server_args", None)):
         return False
     _raise_if_unsupported(kvc)
@@ -603,6 +704,9 @@ class _SharedPagesAllocator(TpuPagedTokenToKVPoolAllocator):
         self._group_pages = group_pages
         self._pages_per_id = 1 if group_pages is None else group_pages.shape[0] + 1
         self._free_pages_before_take: Optional[torch.Tensor] = None
+        self._on_ensure_pages: Optional[Callable[[int], bool]] = None
+        self._on_take_pages: Optional[Callable[[torch.Tensor], None]] = None
+        self._on_release_pages: Optional[Callable[[torch.Tensor], None]] = None
         super().__init__(
             size=size,
             page_size=page_size,
@@ -632,16 +736,18 @@ class _SharedPagesAllocator(TpuPagedTokenToKVPoolAllocator):
     def _count_taken_pages(self, take, *args, **kwargs):
         free_before = self._page_store.num_free_pages()
         out = take(*args, **kwargs)
-        if self._group_pages is not None:
+        if self._group_pages is not None or self._on_take_pages is not None:
             self._take_group_pages()
         self.allocated_pages += free_before - self._page_store.num_free_pages()
         return out
 
     def _ensure_free_pages(self, num_pages: int) -> bool:
-        if self._group_pages is None:
-            return super()._ensure_free_pages(num_pages)
+        if self._on_ensure_pages is not None and not self._on_ensure_pages(num_pages):
+            self._free_pages_before_take = None
+            return False
         ok = super()._ensure_free_pages(num_pages * self._pages_per_id)
-        self._free_pages_before_take = self.free_pages if ok else None
+        if self._group_pages is not None or self._on_take_pages is not None:
+            self._free_pages_before_take = self.free_pages if ok else None
         return ok
 
     def _take_group_pages(self) -> None:
@@ -652,28 +758,50 @@ class _SharedPagesAllocator(TpuPagedTokenToKVPoolAllocator):
         num_taken = len(before) - len(self.free_pages)
         if num_taken == 0:
             return
-        num_extra = self._group_pages.shape[0] * num_taken
-        extra = self.free_pages[:num_extra]
-        self._mark_handed_out(extra)
-        self._group_pages[:, before[:num_taken].long()] = extra.view(-1, num_taken)
-        self.free_pages = self.free_pages[num_extra:]
+        base_pages = before[:num_taken]
+        if self._group_pages is not None:
+            num_extra = self._group_pages.shape[0] * num_taken
+            extra = self.free_pages[:num_extra]
+            self._mark_handed_out(extra)
+            self._group_pages[:, base_pages.long()] = extra.view(-1, num_taken)
+            self.free_pages = self.free_pages[num_extra:]
+        if self._on_take_pages is not None:
+            self._on_take_pages(base_pages)
 
     def _release_page_ids(self, *page_ids: torch.Tensor) -> None:
-        page_ids = tuple(
+        base_page_ids = tuple(
             ids[ids > 0]
             for ids in (
                 p.reshape(-1).to(device="cpu", dtype=torch.int32) for p in page_ids
             )
         )
-        if self._group_pages is not None and page_ids:
-            ids = torch.cat([p.to(torch.int64) for p in page_ids])
-            if ids.numel() > 0:
-                page_ids = (*page_ids, self._group_pages[:, ids].reshape(-1))
-        total_released = sum(ids.numel() for ids in page_ids)
+        flat_base = (
+            torch.cat([p.to(torch.int64) for p in base_page_ids])
+            if base_page_ids
+            else None
+        )
+        if (
+            flat_base is not None
+            and flat_base.numel() > 0
+            and self._on_release_pages is not None
+        ):
+            self._on_release_pages(flat_base)
+        if (
+            self._group_pages is not None
+            and flat_base is not None
+            and flat_base.numel() > 0
+        ):
+            all_page_ids = (
+                *base_page_ids,
+                self._group_pages[:, flat_base].reshape(-1),
+            )
+        else:
+            all_page_ids = base_page_ids
+        total_released = sum(ids.numel() for ids in all_page_ids)
         if total_released == 0:
             return
         self.allocated_pages -= total_released
-        super()._release_page_ids(*page_ids)
+        super()._release_page_ids(*all_page_ids)
 
     def clear(self) -> None:
         super().clear()
@@ -704,6 +832,13 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.need_sort = need_sort
         self._kvcache = kvcache
         self._req_to_token_pool = req_to_token_pool
+        self.draft_kv_pool: Optional[KVCache] = None
+        self.draft_kv_pools: list[KVCache] = []
+        self._draft_sidecar_allocator: Optional[TpuPagedTokenToKVPoolAllocator] = None
+        self._draft_sidecar_pages_per_id = 0
+        self._draft_overflow_pool: Optional[TpuUnifiedSWAKVPool] = None
+        self.target_swa_to_draft_swa: Optional[torch.Tensor] = None
+        self.draft_full_to_swa_index_mapping: Optional[torch.Tensor] = None
         super().__init__(
             size=size,
             size_swa=size,
@@ -740,9 +875,261 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.swa_attn_allocator.clear()
         self.full_attn_allocator.clear()
         self.full_to_swa_index_mapping[:-1].fill_(0)
+        if self._draft_sidecar_allocator is not None:
+            self._draft_sidecar_allocator.clear()
+        if self._draft_overflow_pool is not None:
+            self._draft_overflow_pool.swa_group_pages.zero_()
+        if self.target_swa_to_draft_swa is not None:
+            self.target_swa_to_draft_swa.zero_()
+        if self.draft_full_to_swa_index_mapping is not None:
+            self.draft_full_to_swa_index_mapping[:-1].fill_(0)
         self.free_group = None
         self.swa_free_group = []
         self.swa_page_ids_group = []
+
+    def extra_fence_page_pools(self) -> Tuple[TpuPagedTokenToKVPoolAllocator, ...]:
+        if self._draft_sidecar_allocator is None:
+            return ()
+        return (self._draft_sidecar_allocator,)
+
+    def _sidecar_free_swa_ids(self) -> Optional[int]:
+        if self._draft_sidecar_allocator is None or self._draft_sidecar_pages_per_id <= 0:
+            return None
+        free_tokens = self._draft_sidecar_allocator.available_size()
+        return (free_tokens // self.page_size) // self._draft_sidecar_pages_per_id
+
+    def derive_draft_pool_sizes(self, draft_kvc, sizes) -> dict:
+        del sizes
+        scale = int(getattr(draft_kvc, "loc_space_scale", 1) or 1)
+        n_t = self.size_full // self.page_size
+        ps = self.page_size * scale
+        if not getattr(draft_kvc, "is_hybrid_swa", False):
+            return {"max_total_num_tokens": n_t * ps}
+        draft_layout = _draft_unified_layout_or_none(draft_kvc)
+        if draft_layout is not None:
+            n_d = draft_case2b_num_pages(
+                n_t, self._swa_groups, draft_layout.num_swa_groups
+            )
+            draft_tokens = n_d * ps
+            return {
+                "max_total_num_tokens": draft_tokens,
+                "full_max_total_num_tokens": draft_tokens,
+                "swa_max_total_num_tokens": draft_tokens,
+            }
+        swa_ids = getattr(draft_kvc.layer_info, "swa_attention_layer_ids", None) or ()
+        full_tokens = n_t * ps
+        if getattr(draft_kvc, "draft_swa_full_capacity", False) or len(swa_ids) == 0:
+            return {
+                "max_total_num_tokens": full_tokens,
+                "full_max_total_num_tokens": full_tokens,
+                "swa_max_total_num_tokens": full_tokens,
+            }
+        swa_tokens = draft_case2c_swa_num_pages(n_t, self._swa_groups) * ps
+        return {
+            "max_total_num_tokens": full_tokens,
+            "full_max_total_num_tokens": full_tokens,
+            "swa_max_total_num_tokens": swa_tokens,
+        }
+
+    def _install_sidecar_allocator(
+        self, sidecar: TpuPagedTokenToKVPoolAllocator, pages_per_id: int
+    ) -> None:
+        assert self._draft_sidecar_allocator is None, (
+            "At most one stateful SWA draft KV pool can be coupled to "
+            "TpuUnifiedSWATokenToKVPoolAllocator."
+        )
+        assert self.swa_attn_allocator.allocated_pages == 0, (
+            "Draft KV pool must be attached before SWA pages are allocated."
+        )
+        self._draft_sidecar_allocator = sidecar
+        self._draft_sidecar_pages_per_id = pages_per_id
+        fence = getattr(self.full_attn_allocator, "kv_free_fence", None)
+        if fence is not None:
+            fence.attach(sidecar)
+
+    def attach_draft_kv_pool(
+        self,
+        draft_pool: KVCache,
+        *,
+        draft_swa_full_capacity: bool = False,
+    ) -> None:
+        if self.draft_kv_pool is None:
+            self.draft_kv_pool = draft_pool
+        self.draft_kv_pools.append(draft_pool)
+
+        if draft_swa_full_capacity:
+            n = self.size_full + self.page_size
+            identity_mapping = torch.arange(
+                n + 1,
+                dtype=torch.int64,
+                device=self.full_to_swa_index_mapping.device,
+            )
+            identity_mapping[-1] = -1
+            draft_pool.register_mapping(identity_mapping)
+            return
+
+        if isinstance(draft_pool, TpuUnifiedSWAKVPool):
+            draft_pool.register_mapping(self.full_to_swa_index_mapping)
+            m_d = draft_pool.layout.num_swa_groups
+            m_t = self._swa_groups
+            if m_d <= 1:
+                return
+            if m_d <= m_t:
+                draft_pool.swa_group_pages = self._kvcache.swa_group_pages[: m_d - 1]
+                return
+            n_t = self.size_full // self.page_size
+            n_d = draft_pool.size // self.page_size
+            extra_groups = m_d - m_t
+            num_overflow_pages = n_d - n_t
+            if num_overflow_pages < extra_groups:
+                raise ValueError(
+                    f"Draft unified pool size ({n_d} pages) is too small for "
+                    f"overflow groups (target={n_t} pages, M_T={m_t}, M_D={m_d})."
+                )
+            sidecar = TpuPagedTokenToKVPoolAllocator(
+                size=num_overflow_pages * self.page_size,
+                page_size=self.page_size,
+                dtype=self.dtype,
+                device=self.device,
+                kvcache=draft_pool.kv_pool,
+                need_sort=self.need_sort,
+            )
+            self._install_sidecar_allocator(sidecar, extra_groups)
+            self._draft_overflow_pool = draft_pool
+
+            def _ensure_overflow(num_pages: int) -> bool:
+                return sidecar._ensure_free_pages(num_pages * extra_groups)
+
+            def _take_overflow(base_pages: torch.Tensor) -> None:
+                n = int(base_pages.numel())
+                need = n * extra_groups
+                ok = sidecar._ensure_free_pages(need)
+                assert ok
+                raw = sidecar.free_pages[:need]
+                sidecar.free_pages = sidecar.free_pages[need:]
+                sidecar._mark_handed_out(raw)
+                cols = base_pages.long()
+                if m_t > 1:
+                    draft_pool.swa_group_pages[: m_t - 1, cols] = (
+                        self._kvcache.swa_group_pages[:, cols]
+                    )
+                draft_pool.swa_group_pages[m_t - 1 :, cols] = (raw + n_t).view(
+                    extra_groups, n
+                )
+
+            def _release_overflow(flat_base: torch.Tensor) -> None:
+                overflow = (
+                    draft_pool.swa_group_pages[m_t - 1 :, flat_base].reshape(-1) - n_t
+                )
+                draft_pool.swa_group_pages[:, flat_base] = 0
+                valid = overflow[overflow > 0]
+                if valid.numel() > 0:
+                    sidecar._release_page_ids(valid)
+
+            self.swa_attn_allocator._on_ensure_pages = _ensure_overflow
+            self.swa_attn_allocator._on_take_pages = _take_overflow
+            self.swa_attn_allocator._on_release_pages = _release_overflow
+            return
+
+        if isinstance(draft_pool, SWAKVPool):
+            if draft_pool.swa_layer_nums == 0:
+                draft_pool.register_mapping(self.full_to_swa_index_mapping)
+                return
+            n_t = self.size_full // self.page_size
+            sidecar = TpuPagedTokenToKVPoolAllocator(
+                size=draft_pool.size_swa,
+                page_size=self.page_size,
+                dtype=self.dtype,
+                device=self.device,
+                kvcache=draft_pool.swa_kv_pool,
+                need_sort=self.need_sort,
+            )
+            self._install_sidecar_allocator(sidecar, 1)
+            self.target_swa_to_draft_swa = torch.zeros(
+                n_t + 1, dtype=torch.int32, device="cpu"
+            )
+            self.draft_full_to_swa_index_mapping = (
+                self.full_to_swa_index_mapping.clone()
+            )
+            draft_pool.register_mapping(self.draft_full_to_swa_index_mapping)
+
+            def _ensure_compact(num_pages: int) -> bool:
+                return sidecar._ensure_free_pages(num_pages)
+
+            def _take_compact(base_pages: torch.Tensor) -> None:
+                n = int(base_pages.numel())
+                ok = sidecar._ensure_free_pages(n)
+                assert ok
+                draft_pages = sidecar.free_pages[:n]
+                sidecar.free_pages = sidecar.free_pages[n:]
+                sidecar._mark_handed_out(draft_pages)
+                self.target_swa_to_draft_swa[base_pages.long()] = draft_pages
+
+            def _release_compact(flat_base: torch.Tensor) -> None:
+                draft_pages = self.target_swa_to_draft_swa[flat_base]
+                self.target_swa_to_draft_swa[flat_base] = 0
+                valid = draft_pages[draft_pages > 0]
+                if valid.numel() > 0:
+                    sidecar._release_page_ids(valid)
+
+            self.swa_attn_allocator._on_ensure_pages = _ensure_compact
+            self.swa_attn_allocator._on_take_pages = _take_compact
+            self.swa_attn_allocator._on_release_pages = _release_compact
+
+    def translate_target_swa_pages_to_draft(
+        self, target_swa_pages: torch.Tensor
+    ) -> torch.Tensor:
+        if self.target_swa_to_draft_swa is None:
+            return target_swa_pages
+        pages_cpu = target_swa_pages.to(device="cpu", dtype=torch.int64)
+        out = torch.where(
+            pages_cpu > 0,
+            self.target_swa_to_draft_swa[pages_cpu.clamp(min=0)].to(torch.int64),
+            pages_cpu,
+        )
+        return out.to(device=target_swa_pages.device, dtype=target_swa_pages.dtype)
+
+    def _translate_swa_slots_for_draft(self, swa_indices: torch.Tensor) -> torch.Tensor:
+        assert self.target_swa_to_draft_swa is not None
+        ps = self.page_size
+        swa_cpu = swa_indices.to(device="cpu", dtype=torch.int64)
+        pages = torch.div(swa_cpu.clamp(min=0), ps, rounding_mode="floor")
+        draft_pages = self.target_swa_to_draft_swa[pages].to(torch.int64)
+        mapped = draft_pages * ps + (swa_cpu % ps)
+        out = torch.where(swa_cpu > 0, mapped, swa_cpu)
+        assert self.draft_full_to_swa_index_mapping is not None
+        return out.to(
+            device=self.draft_full_to_swa_index_mapping.device,
+            dtype=self.draft_full_to_swa_index_mapping.dtype,
+        )
+
+    def set_full_to_swa_mapping(
+        self, full_indices: torch.Tensor, swa_indices: torch.Tensor
+    ) -> None:
+        super().set_full_to_swa_mapping(full_indices, swa_indices)
+        if self.draft_full_to_swa_index_mapping is None or full_indices.numel() == 0:
+            return
+        mapping = self.draft_full_to_swa_index_mapping
+        mapping[full_indices.to(mapping.device, torch.int64)] = (
+            self._translate_swa_slots_for_draft(swa_indices)
+        )
+
+    def clear_full_to_swa_mapping(self, full_indices: torch.Tensor) -> None:
+        super().clear_full_to_swa_mapping(full_indices)
+        if self.draft_full_to_swa_index_mapping is None or full_indices.numel() == 0:
+            return
+        mapping = self.draft_full_to_swa_index_mapping
+        mapping[full_indices.to(mapping.device, torch.int64)] = 0
+
+    def free_swa(self, free_index: torch.Tensor):
+        if (
+            self.draft_full_to_swa_index_mapping is not None
+            and not self._swa_req_ring
+            and free_index.numel() > 0
+        ):
+            mapping = self.draft_full_to_swa_index_mapping
+            mapping[free_index.to(mapping.device)] = 0
+        return super().free_swa(free_index)
 
     def _free_page_count(self) -> int:
         return self._page_store.num_free_pages()
@@ -769,7 +1156,11 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         return self._free_page_count() * self.page_size
 
     def swa_available_size(self) -> int:
-        return (self._free_page_count() // self._swa_groups) * self.page_size
+        avail = (self._free_page_count() // self._swa_groups) * self.page_size
+        sidecar_ids = self._sidecar_free_swa_ids()
+        if sidecar_ids is not None:
+            avail = min(avail, sidecar_ids * self.page_size)
+        return avail
 
     def conserve_full_available_size(self) -> int:
         return self._size_full - self.full_attn_allocator.allocated_count()
@@ -803,9 +1194,13 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         )
 
     def new_pages_available(self, num_full_pages: int, num_swa_pages: int) -> bool:
+        if min(num_full_pages, num_swa_pages) < 0:
+            return False
+        sidecar_ids = self._sidecar_free_swa_ids()
+        if sidecar_ids is not None and num_swa_pages > sidecar_ids:
+            return False
         return (
-            min(num_full_pages, num_swa_pages) >= 0
-            and self._page_ids_needed(num_full_pages, num_swa_pages)
+            self._page_ids_needed(num_full_pages, num_swa_pages)
             <= self._free_page_count()
         )
 
@@ -866,9 +1261,17 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         num_new_pages = int((seq_lens_cpu % self.page_size == 1).sum())
         if not self.new_pages_available(num_new_pages, num_new_pages):
             return None
-        return super().alloc_decode(
+        res = super().alloc_decode(
             seq_lens, seq_lens_cpu, last_loc, out_indices_cpu=out_indices_cpu
         )
+        if res is not None and self.draft_full_to_swa_index_mapping is not None:
+            full_src = out_indices_cpu if out_indices_cpu is not None else res
+            full_idx = full_src.to(self.full_to_swa_index_mapping.device, torch.int64)
+            swa_idx = self.full_to_swa_index_mapping[full_idx]
+            self.draft_full_to_swa_index_mapping[
+                full_idx.to(self.draft_full_to_swa_index_mapping.device)
+            ] = self._translate_swa_slots_for_draft(swa_idx)
+        return res
 
     def can_reserve(
         self,
@@ -887,14 +1290,23 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         ):
             return False
         ps = self.page_size
-        need = self._page_ids_needed(
-            (math.ceil(full_tokens) + ps - 1) // ps,
-            (math.ceil(swa_tokens) + ps - 1) // ps,
-        )
+        need_f = (math.ceil(full_tokens) + ps - 1) // ps
+        need_s = (math.ceil(swa_tokens) + ps - 1) // ps
+        need = self._page_ids_needed(need_f, need_s)
         if empty_pool:
+            if (
+                self._draft_sidecar_allocator is not None
+                and self._draft_sidecar_pages_per_id > 0
+            ):
+                cap_ids = (
+                    self._draft_sidecar_allocator.size // ps
+                ) // self._draft_sidecar_pages_per_id
+                if need_s > cap_ids:
+                    return False
             return need <= self.size_full // ps
         free = self._free_page_count()
-        if need <= free:
+        sidecar_ids = self._sidecar_free_swa_ids()
+        if need <= free and (sidecar_ids is None or need_s <= sidecar_ids):
             return True
         ms = self._swa_groups
         max_f = min(
@@ -905,6 +1317,8 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             self.swa_attn_allocator.allocated_pages // ms,
             max(0, int(swa_evictable_tokens)) // ps,
         )
+        if sidecar_ids is not None and need_s > sidecar_ids + max_s:
+            return False
         return need <= free + self._page_ids_needed(max_f, max_s)
 
     def max_new_tokens_for_memory(
@@ -961,11 +1375,16 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
                 EvictParams(num_tokens=short * ps, swa_num_tokens=0)
             )
         short = needed_pages - self._free_page_count()
-        if short > 0:
+        sidecar_ids = self._sidecar_free_swa_ids()
+        sidecar_short = (
+            0 if sidecar_ids is None else max(0, need_s - sidecar_ids)
+        )
+        if short > 0 or sidecar_short > 0:
+            swa_pages_to_evict = max(_cdiv(max(0, short), self._swa_groups), sidecar_short)
             tree_cache.evict_for_alloc(
                 EvictParams(
                     num_tokens=0,
-                    swa_num_tokens=_cdiv(short, self._swa_groups) * ps,
+                    swa_num_tokens=swa_pages_to_evict * ps,
                 )
             )
         return self.new_pages_available(need_f, need_s)
@@ -1011,6 +1430,78 @@ class TpuUnifiedSWAPoolConfigurator(MemoryPoolConfigurator):
         )
         self._reserved_bytes = self._page_bytes
         self._align_pages = 8
+        (
+            self._draft_full_layers,
+            self._draft_swa_layers,
+            self._draft_full_per_token,
+            self._draft_swa_per_token,
+            self._draft_swa_full_capacity,
+            self._draft_homogeneous,
+        ) = self._extract_draft_pricing(kvc)
+
+    def _extract_draft_pricing(
+        self, kvc
+    ) -> Tuple[int, int, int, int, bool, bool]:
+        spec_algo = kvc.spec_algorithm
+        if not _has_draft_kv_pool(spec_algo):
+            return 0, 0, 0, 0, False, True
+        aux = getattr(kvc, "spec_aux_config", None)
+        if aux is None:
+            return 0, 0, 0, 0, False, True
+        l_full = int(getattr(aux, "draft_full_num_layers", 0) or 0)
+        l_swa = int(getattr(aux, "draft_swa_num_layers", 0) or 0)
+        b_full = getattr(aux, "draft_full_bytes_per_token", None)
+        b_swa = getattr(aux, "draft_swa_bytes_per_token", None)
+        swa_full_cap = bool(getattr(aux, "draft_swa_uses_full_capacity", False))
+        homogeneous = bool(getattr(aux, "draft_kv_heads_homogeneous", True))
+        if l_full == 0 and l_swa == 0:
+            if spec_algo.is_dflash_family():
+                dflash_layers = int(getattr(aux, "dflash_draft_num_layers", 0) or 0)
+                cell = int(getattr(aux, "dflash_draft_cell_size_per_token", 0) or 0)
+                if dflash_layers > 0:
+                    l_full = dflash_layers
+                    b_full = (
+                        cell // dflash_layers if cell > 0 else self._full_per_token
+                    )
+            else:
+                eagle_total = int(getattr(aux, "eagle_draft_num_layers", 0) or 0)
+                eagle_swa = int(getattr(aux, "eagle_draft_swa_num_layers", 0) or 0)
+                if eagle_total > 0:
+                    l_swa = min(eagle_swa, eagle_total)
+                    l_full = eagle_total - l_swa
+                    if l_swa > 0 and l_full == 0 and eagle_total == l_swa:
+                        swa_full_cap = False
+        resolved_full = (
+            self._full_per_token if b_full is None else int(b_full)
+        )
+        resolved_swa = (
+            resolved_full if b_swa is None else int(b_swa)
+        )
+        return l_full, l_swa, resolved_full, resolved_swa, swa_full_cap, homogeneous
+
+    def _draft_bytes_for_target_pages(self, n_t: int, page_size: int) -> int:
+        l_full = self._draft_full_layers
+        l_swa = self._draft_swa_layers
+        if l_full <= 0 and l_swa <= 0:
+            return 0
+        b_full = self._draft_full_per_token
+        b_swa = self._draft_swa_per_token
+        if l_swa <= 0:
+            return (n_t + 1) * page_size * l_full * b_full
+        if self._draft_swa_full_capacity:
+            return (n_t + 1) * page_size * (l_full * b_full + l_swa * b_swa)
+        if l_full > 0 and self._draft_homogeneous:
+            m_d = num_swa_groups(l_full, l_swa)
+            n_d = draft_case2b_num_pages(
+                n_t, self._num_swa_groups, m_d, align_pages=self._align_pages
+            )
+            return (n_d + 1) * page_size * l_full * b_full
+        full_bytes = (n_t + 1) * page_size * l_full * b_full if l_full > 0 else 0
+        n_d = draft_case2c_swa_num_pages(
+            n_t, self._num_swa_groups, align_pages=self._align_pages
+        )
+        swa_bytes = (n_d + 1) * page_size * l_swa * b_swa
+        return full_bytes + swa_bytes
 
     @staticmethod
     def _compute_full_per_token(kvc, layout: UnifiedPageLayout) -> int:
@@ -1041,14 +1532,42 @@ class TpuUnifiedSWAPoolConfigurator(MemoryPoolConfigurator):
                 f"even one request: need > {min_tokens} tokens."
             )
 
+    def _total_bytes_for_target_pages(self, n_t: int, page_size: int) -> int:
+        page_bytes = page_size * self._full_per_token * self._full_layers_num
+        return (n_t + 1) * page_bytes + self._draft_bytes_for_target_pages(
+            n_t, page_size
+        )
+
     def calculate_total_physical_pages(
         self, available_bytes: int, page_size: int
     ) -> int:
-        """Compute aligned physical page count directly from free HBM quota and Full layers."""
-        usable = max(0, available_bytes - self._reserved_bytes)
+        """Compute aligned physical page count directly from free HBM quota and Full + Draft layers."""
         page_bytes = page_size * self._full_per_token * self._full_layers_num
-        raw_pages = usable // page_bytes if page_bytes > 0 else 0
-        return (raw_pages // self._align_pages) * self._align_pages
+        if page_bytes <= 0:
+            return 0
+        if self._draft_full_layers <= 0 and self._draft_swa_layers <= 0:
+            usable = max(0, available_bytes - self._reserved_bytes)
+            raw_pages = usable // page_bytes
+            return (raw_pages // self._align_pages) * self._align_pages
+
+        max_k = max(0, available_bytes - page_bytes) // page_bytes // self._align_pages
+        if (
+            max_k <= 0
+            or self._total_bytes_for_target_pages(self._align_pages, page_size)
+            > available_bytes
+        ):
+            return 0
+        lo, hi = 1, max_k
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if (
+                self._total_bytes_for_target_pages(mid * self._align_pages, page_size)
+                <= available_bytes
+            ):
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo * self._align_pages
 
     def max_request_tokens(self, shared_tokens: int, page_size: int) -> int:
         """Return the maximum single-request context length that fits in ``shared_tokens``
@@ -1094,7 +1613,7 @@ class TpuUnifiedSWAPoolConfigurator(MemoryPoolConfigurator):
 
 def maybe_create_unified_pool_configurator(kvc) -> Optional[MemoryPoolConfigurator]:
     """Return ``TpuUnifiedSWAPoolConfigurator(kvc)`` when unified KV pool is enabled, else ``None``."""
-    if not unified_kv_pool_enabled(kvc):
+    if not unified_kv_pool_enabled(kvc) or getattr(kvc, "is_draft_worker", False):
         return None
     return TpuUnifiedSWAPoolConfigurator(kvc)
 
@@ -1111,6 +1630,8 @@ def maybe_build_unified_kv_pool(
     assert full_max_total_num_tokens == swa_max_total_num_tokens
     tp = get_parallel().attn_tp_size
     dcp = get_parallel().attn_dcp_size
+    if dcp > 1 and getattr(kvc.model_config, "is_draft_model", False):
+        dcp = 1
     head_dim = kvc.model_config.head_dim
     return TpuUnifiedSWAKVPool(
         size=full_max_total_num_tokens,
@@ -1147,7 +1668,7 @@ def maybe_build_unified_kv_pool_allocator(
     need_sort: bool,
 ) -> Optional[TpuUnifiedSWATokenToKVPoolAllocator]:
     """Build ``TpuUnifiedSWATokenToKVPoolAllocator`` for ``kvc`` when unified KV pool is enabled, else ``None``."""
-    if not unified_kv_pool_enabled(kvc):
+    if getattr(kvc, "is_draft_worker", False) or not unified_kv_pool_enabled(kvc):
         return None
     return TpuUnifiedSWATokenToKVPoolAllocator(
         sizes.full_max_total_num_tokens,

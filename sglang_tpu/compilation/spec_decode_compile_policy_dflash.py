@@ -39,6 +39,11 @@ from sglang_tpu.compilation.recompilation_checker import (
 from sglang_tpu.compilation.spec_decode_compile_policy import (
     BaseSpecDecodeCompilePolicyMixin,
 )
+from sglang_tpu.dflash_draft_kv_write import (
+    draft_kv_has_swa,
+    draft_kv_num_addr_groups,
+    map_draft_kv_locs,
+)
 from sglang_tpu.dflash_utils_tpu import build_dflash_draft_block
 from sglang_tpu.envs import envs as tpu_envs
 
@@ -519,7 +524,7 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             if commit_lens is None:
                 raise ValueError("DFLASH cache_loc_2d requires commit_lens.")
             bs = int(commit_lens.shape[0])
-            if int(cache_loc_2d.shape[0]) != bs:
+            if cache_loc_2d.ndim not in (2, 3) or int(cache_loc_2d.shape[-2]) != bs:
                 raise ValueError(
                     "DFLASH cache_loc_2d batch size mismatch: "
                     f"cache_loc_2d={tuple(cache_loc_2d.shape)}, commit_lens={tuple(commit_lens.shape)}."
@@ -529,12 +534,25 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             pad_bs = (
                 self.b_bucketer.next_bucket(bs) if self.b_bucketer is not None else bs
             )
-            block_size = int(cache_loc_2d.shape[1])
+            block_size = int(cache_loc_2d.shape[-1])
             if pad_bs > bs:
                 pad_rows = pad_bs - bs
-                cache_loc_2d = torch.nn.functional.pad(
-                    cache_loc_2d, (0, 0, 0, pad_rows)
-                )
+                if cache_loc_2d.ndim == 2:
+                    cache_loc_2d = torch.nn.functional.pad(
+                        cache_loc_2d, (0, 0, 0, pad_rows)
+                    )
+                else:
+                    cache_loc_2d = torch.cat(
+                        [
+                            torch.nn.functional.pad(
+                                cache_loc_2d[:1], (0, 0, 0, pad_rows), value=0
+                            ),
+                            torch.nn.functional.pad(
+                                cache_loc_2d[1:], (0, 0, 0, pad_rows), value=-1
+                            ),
+                        ],
+                        dim=0,
+                    )
                 commit_lens = torch.nn.functional.pad(commit_lens, (0, pad_rows))
                 target_hidden = torch.nn.functional.pad(
                     target_hidden, (0, 0, 0, pad_rows * block_size)
@@ -542,9 +560,21 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
                 positions = torch.nn.functional.pad(
                     positions, (0, pad_rows * block_size)
                 )
-                cache_loc = torch.nn.functional.pad(
-                    cache_loc, (0, pad_rows * block_size)
-                )
+                pad_tokens = pad_rows * block_size
+                if cache_loc.ndim == 1:
+                    cache_loc = torch.nn.functional.pad(cache_loc, (0, pad_tokens))
+                else:
+                    cache_loc = torch.cat(
+                        [
+                            torch.nn.functional.pad(
+                                cache_loc[:1], (0, pad_tokens), value=0
+                            ),
+                            torch.nn.functional.pad(
+                                cache_loc[1:], (0, pad_tokens), value=-1
+                            ),
+                        ],
+                        dim=0,
+                    )
             return target_hidden, cache_loc, positions, cache_loc_2d, commit_lens
 
         num_tokens = int(target_hidden.shape[0])
@@ -559,7 +589,18 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             pad_count = pad_num_tokens - num_tokens
             target_hidden = torch.nn.functional.pad(target_hidden, (0, 0, 0, pad_count))
             positions = torch.nn.functional.pad(positions, (0, pad_count))
-            cache_loc = torch.nn.functional.pad(cache_loc, (0, pad_count))
+            if cache_loc.ndim == 1:
+                cache_loc = torch.nn.functional.pad(cache_loc, (0, pad_count))
+            else:
+                cache_loc = torch.cat(
+                    [
+                        torch.nn.functional.pad(cache_loc[:1], (0, pad_count), value=0),
+                        torch.nn.functional.pad(
+                            cache_loc[1:], (0, pad_count), value=-1
+                        ),
+                    ],
+                    dim=0,
+                )
         return target_hidden, cache_loc, positions, None, None
 
     def append_target_hidden_to_draft_kv_by_loc_tpu(
@@ -570,11 +611,18 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         positions: torch.Tensor,
         cache_loc_2d: torch.Tensor | None = None,
         commit_lens: torch.Tensor | None = None,
+        locs_are_mapped: bool = False,
     ) -> torch.Tensor | None:
         """Pad inputs and execute compiled draft KV materialization on TPU.
 
         Returns what the compiled writer returns, None when there is nothing to write.
         """
+        if not locs_are_mapped:
+            kv_pool = getattr(self.model_runner, "token_to_kv_pool", None)
+            if kv_pool is not None and draft_kv_has_swa(kv_pool):
+                cache_loc = map_draft_kv_locs(kv_pool, cache_loc)
+                if cache_loc_2d is not None:
+                    cache_loc_2d = map_draft_kv_locs(kv_pool, cache_loc_2d)
         padded = self.pad_append_target_hidden_tpu(
             target_hidden=target_hidden,
             cache_loc=cache_loc,
@@ -785,12 +833,16 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         device = self.model_runner.device
         dtype = self.model_runner.dtype
         cache_loc_dtype = self._dummy_out_cache_loc_dtype(ForwardMode.TARGET_VERIFY)
+        num_groups = draft_kv_num_addr_groups(
+            getattr(self.model_runner, "token_to_kv_pool", None)
+        )
         logger.info(
-            "[spec compile policy] %s DRAFT APPEND KV (VERIFY): %d shapes (bs=%s, draft_token_num=%d)",
+            "[spec compile policy] %s DRAFT APPEND KV (VERIFY): %d shapes (bs=%s, draft_token_num=%d, groups=%d)",
             self.algo_label,
             len(bs_buckets),
             bs_buckets,
             draft_token_num,
+            num_groups,
         )
 
         def run(bs: int) -> str:
@@ -798,11 +850,45 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             target_hidden = torch.zeros(
                 (num_tokens, target_hidden_size), dtype=dtype, device=device
             )
-            cache_loc = torch.zeros((num_tokens,), dtype=cache_loc_dtype, device=device)
             positions = torch.zeros((num_tokens,), dtype=torch.int64, device=device)
-            cache_loc_2d = torch.zeros(
-                (bs, draft_token_num), dtype=cache_loc_dtype, device=device
-            )
+            if num_groups == 1:
+                cache_loc = torch.zeros(
+                    (num_tokens,), dtype=cache_loc_dtype, device=device
+                )
+                cache_loc_2d = torch.zeros(
+                    (bs, draft_token_num), dtype=cache_loc_dtype, device=device
+                )
+            else:
+                cache_loc = torch.cat(
+                    [
+                        torch.zeros(
+                            (1, num_tokens), dtype=cache_loc_dtype, device=device
+                        ),
+                        torch.full(
+                            (num_groups - 1, num_tokens),
+                            -1,
+                            dtype=cache_loc_dtype,
+                            device=device,
+                        ),
+                    ],
+                    dim=0,
+                )
+                cache_loc_2d = torch.cat(
+                    [
+                        torch.zeros(
+                            (1, bs, draft_token_num),
+                            dtype=cache_loc_dtype,
+                            device=device,
+                        ),
+                        torch.full(
+                            (num_groups - 1, bs, draft_token_num),
+                            -1,
+                            dtype=cache_loc_dtype,
+                            device=device,
+                        ),
+                    ],
+                    dim=0,
+                )
             commit_lens = torch.zeros((bs,), dtype=torch.int32, device=device)
             self.append_target_hidden_to_draft_kv_by_loc_tpu(
                 target_hidden=target_hidden,
@@ -810,6 +896,7 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
                 positions=positions,
                 cache_loc_2d=cache_loc_2d,
                 commit_lens=commit_lens,
+                locs_are_mapped=True,
             )
             return f"bs={bs}, tokens={num_tokens}"
 
@@ -824,11 +911,15 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
                 "t_bucketer must be initialized before precompiling draft extend."
             )
         token_buckets = list(self.t_bucketer.buckets)
+        num_groups = draft_kv_num_addr_groups(
+            getattr(self.model_runner, "token_to_kv_pool", None)
+        )
         logger.info(
-            "[spec compile policy] %s DRAFT APPEND KV (EXTEND): %d shapes (token_buckets=%s)",
+            "[spec compile policy] %s DRAFT APPEND KV (EXTEND): %d shapes (token_buckets=%s, groups=%d)",
             self.algo_label,
             len(token_buckets),
             token_buckets,
+            num_groups,
         )
         target_hidden_size = self.dflash_target_hidden_size
         device = self.model_runner.device
@@ -840,12 +931,31 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             target_hidden = torch.zeros(
                 (num_tokens, target_hidden_size), dtype=dtype, device=device
             )
-            cache_loc = torch.zeros((num_tokens,), dtype=cache_loc_dtype, device=device)
+            if num_groups == 1:
+                cache_loc = torch.zeros(
+                    (num_tokens,), dtype=cache_loc_dtype, device=device
+                )
+            else:
+                cache_loc = torch.cat(
+                    [
+                        torch.zeros(
+                            (1, num_tokens), dtype=cache_loc_dtype, device=device
+                        ),
+                        torch.full(
+                            (num_groups - 1, num_tokens),
+                            -1,
+                            dtype=cache_loc_dtype,
+                            device=device,
+                        ),
+                    ],
+                    dim=0,
+                )
             positions = torch.zeros((num_tokens,), dtype=torch.int64, device=device)
             self.append_target_hidden_to_draft_kv_by_loc_tpu(
                 target_hidden=target_hidden,
                 cache_loc=cache_loc,
                 positions=positions,
+                locs_are_mapped=True,
             )
             return f"tokens={num_tokens}"
 

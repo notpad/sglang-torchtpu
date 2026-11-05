@@ -2227,7 +2227,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             if cache_loc_2d is not None:
                 assert commit_lens is not None
                 bs = int(commit_lens.shape[0])
-                if int(cache_loc_2d.shape[0]) != bs:
+                if int(cache_loc_2d.shape[-2]) != bs:
                     raise ValueError(
                         "DFLASH cache_loc_2d batch size mismatch: "
                         f"cache_loc_2d={tuple(cache_loc_2d.shape)},"
@@ -2262,18 +2262,18 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         num_tokens = int(target_hidden.shape[0])
 
-        if cache_loc.ndim != 1:
+        if cache_loc.ndim not in (1, 2):
             raise ValueError(
-                f"DFLASH cache_loc must be 1D, got shape={tuple(cache_loc.shape)}."
+                f"DFLASH cache_loc must be 1D or 2D, got shape={tuple(cache_loc.shape)}."
             )
         if positions.ndim != 1:
             raise ValueError(
                 f"DFLASH positions must be 1D, got shape={tuple(positions.shape)}."
             )
-        if int(cache_loc.numel()) != num_tokens:
+        if int(cache_loc.shape[-1]) != num_tokens:
             raise ValueError(
                 "DFLASH cache_loc length mismatch: "
-                f"cache_loc={int(cache_loc.numel())}, target_hidden={num_tokens}."
+                f"cache_loc={int(cache_loc.shape[-1])}, target_hidden={num_tokens}."
             )
         if int(positions.numel()) != num_tokens:
             raise ValueError(
@@ -2281,15 +2281,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                 f"positions={int(positions.numel())}, target_hidden={num_tokens}."
             )
         if cache_loc_2d is not None:
-            if cache_loc_2d.ndim != 2:
+            if cache_loc_2d.ndim not in (2, 3):
                 raise ValueError(
-                    "DFLASH cache_loc_2d must be 2D, "
+                    "DFLASH cache_loc_2d must be 2D or 3D, "
                     f"got shape={tuple(cache_loc_2d.shape)}."
                 )
-            if int(cache_loc_2d.numel()) != num_tokens:
+            if int(cache_loc_2d.shape[-2] * cache_loc_2d.shape[-1]) != num_tokens:
                 raise ValueError(
                     "DFLASH cache_loc_2d size mismatch: "
-                    f"cache_loc_2d={int(cache_loc_2d.numel())}, target_hidden={num_tokens}."
+                    f"cache_loc_2d={tuple(cache_loc_2d.shape)}, target_hidden={num_tokens}."
                 )
             if commit_lens is None:
                 raise ValueError(

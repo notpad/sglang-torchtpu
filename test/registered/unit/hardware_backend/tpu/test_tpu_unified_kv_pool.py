@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import types
+from types import SimpleNamespace
 import unittest
 from array import array
 from contextlib import ExitStack
@@ -787,8 +788,8 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
                 ("use_mla_backend", True),
                 ("mambaish_config", object()),
                 ("hybrid_gdn_config", object()),
-                ("is_draft_worker", True),
-                ("spec_algorithm", SpeculativeAlgorithm.EAGLE),
+                ("spec_algorithm", SpeculativeAlgorithm.UNO),
+                ("spec_algorithm", SpeculativeAlgorithm.FROZEN_KV_MTP),
                 ("pp_size", 2),
                 ("_tpu_mha_pool_class", lambda: MHATokenToKVPool),
                 ("_tpu_mha_pool_class", lambda: object),
@@ -798,6 +799,38 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
                 setattr(kvc, attr, val)
                 with self.assertRaises(ValueError):
                     unified_kv_pool_enabled(kvc)
+            for supported_spec in (
+                SpeculativeAlgorithm.EAGLE,
+                SpeculativeAlgorithm.EAGLE3,
+                SpeculativeAlgorithm.from_string("NEXTN"),
+                SpeculativeAlgorithm.DFLASH,
+                SpeculativeAlgorithm.DSPARK,
+                SpeculativeAlgorithm.STANDALONE,
+                SpeculativeAlgorithm.NGRAM,
+            ):
+                kvc_spec = copy.copy(base)
+                kvc_spec.spec_algorithm = supported_spec
+                self.assertTrue(unified_kv_pool_enabled(kvc_spec))
+            # PR 6 guard: speculative drafts with KV pools reject disaggregation and HiCache
+            for spec_guard_ctx in (
+                dict(
+                    disaggregation_mode="prefill",
+                    disaggregation_transfer_backend="raiden",
+                ),
+                dict(
+                    enable_hierarchical_cache=True,
+                    hicache_io_backend="raiden",
+                ),
+            ):
+                with self._cfg_patches(**spec_guard_ctx):
+                    kvc_eagle = copy.copy(base)
+                    kvc_eagle.spec_algorithm = SpeculativeAlgorithm.EAGLE3
+                    with self.assertRaisesRegex(ValueError, "--enable-unified-memory"):
+                        unified_kv_pool_enabled(kvc_eagle)
+                    # NGRAM has no draft KV pool, so it remains allowed
+                    kvc_ngram = copy.copy(base)
+                    kvc_ngram.spec_algorithm = SpeculativeAlgorithm.NGRAM
+                    self.assertTrue(unified_kv_pool_enabled(kvc_ngram))
             kvc_asym = self._make_mock_kvc()
             kvc_asym.model_config.has_asymmetric_kv = True
             with self.assertRaises(ValueError):
@@ -1894,6 +1927,1044 @@ class TestTpuUnifiedDMAHiCache(unittest.TestCase):
                 int(pool.swa_group_pages[0, swa_pages[1]]),
                 int(pool.swa_group_pages[1, swa_pages[1]]),
             ],
+        )
+
+
+class TestTpuUnifiedHeterogeneousSpecDrafts(unittest.TestCase):
+    """Tests for PR 6: co-priced heterogeneous speculative drafts across Cases 2a, 2b, 2c, and MTP."""
+
+    def setUp(self):
+        for p in (
+            patch.object(swa, "_is_tpu", True),
+            patch.object(
+                swa,
+                "TpuPagedTokenToKVPoolAllocator",
+                TpuPagedTokenToKVPoolAllocator,
+                create=True,
+            ),
+        ):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _cfg_patches(self, **overrides):
+        return TestTpuUnifiedSWAKVPoolWiring()._cfg_patches(**overrides)
+
+    def _make_mock_kvc(self, **kwargs):
+        return TestTpuUnifiedSWAKVPoolWiring()._make_mock_kvc(**kwargs)
+
+    def test_draft_worker_unified_pool_selection_across_topologies(self):
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang_tpu.unified_kv_pool import (
+            maybe_build_unified_kv_pool,
+            maybe_build_unified_kv_pool_allocator,
+            maybe_create_unified_pool_configurator,
+        )
+
+        with self._cfg_patches():
+            # Case 2a: FA-only draft -> returns False cleanly, no unified pool.
+            draft_2a = self._make_mock_kvc(
+                full_ids=[0, 1, 2, 3], swa_ids=[], head_num=1, head_dim=64
+            )
+            draft_2a.is_hybrid_swa = False
+            draft_2a.is_draft_worker = True
+            draft_2a.spec_algorithm = SpeculativeAlgorithm.DFLASH
+            self.assertFalse(unified_kv_pool_enabled(draft_2a))
+            self.assertIsNone(maybe_create_unified_pool_configurator(draft_2a))
+
+            # Case 2b: Mixed homogeneous FA+SWA draft -> uses TpuUnifiedSWAKVPool,
+            # while allocator creation defers to Target's attach_draft_kv_pool.
+            draft_2b = self._make_mock_kvc(
+                full_ids=[0, 1],
+                swa_ids=[2, 3, 4],
+                head_num=1,
+                head_dim=64,
+                swa_head_num=1,
+                swa_head_dim=64,
+            )
+            draft_2b.is_draft_worker = True
+            draft_2b.draft_swa_full_capacity = False
+            draft_2b.spec_algorithm = SpeculativeAlgorithm.DFLASH
+            self.assertTrue(unified_kv_pool_enabled(draft_2b))
+            self.assertIsNone(maybe_create_unified_pool_configurator(draft_2b))
+            pool_2b = maybe_build_unified_kv_pool(
+                draft_2b,
+                full_max_total_num_tokens=1024,
+                swa_max_total_num_tokens=1024,
+            )
+            self.assertIsInstance(pool_2b, TpuUnifiedSWAKVPool)
+            self.assertEqual(pool_2b.layout.num_shared_buffers, 2)
+            self.assertEqual(pool_2b.layout.num_swa_groups, 2)
+            self.assertIsNone(
+                maybe_build_unified_kv_pool_allocator(
+                    draft_2b,
+                    sizes=types.SimpleNamespace(full_max_total_num_tokens=1024),
+                    token_to_kv_pool=pool_2b,
+                    req_to_token_pool=None,
+                    need_sort=False,
+                )
+            )
+
+            # Case 2c (SWA-only): returns False cleanly -> standard SWAKVPool.
+            draft_2c_swa = self._make_mock_kvc(
+                full_ids=[], swa_ids=[0, 1, 2], head_num=1, head_dim=64
+            )
+            draft_2c_swa.is_draft_worker = True
+            draft_2c_swa.draft_swa_full_capacity = False
+            self.assertFalse(unified_kv_pool_enabled(draft_2c_swa))
+
+            # Case 2c (inhomogeneous mixed H_FA != H_SWA): returns False cleanly.
+            draft_2c_inhomo = self._make_mock_kvc(
+                full_ids=[0],
+                swa_ids=[1, 2],
+                head_num=4,
+                head_dim=64,
+                swa_head_num=1,
+                swa_head_dim=64,
+            )
+            draft_2c_inhomo.is_draft_worker = True
+            draft_2c_inhomo.draft_swa_full_capacity = False
+            self.assertFalse(unified_kv_pool_enabled(draft_2c_inhomo))
+
+            # MTP (draft_swa_full_capacity=True): returns False cleanly.
+            draft_mtp = copy.copy(draft_2b)
+            draft_mtp.draft_swa_full_capacity = True
+            self.assertFalse(unified_kv_pool_enabled(draft_mtp))
+
+    def test_copriced_sizing_fits_budget_across_all_draft_cases(self):
+        from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
+            SpecAuxHiddenStateConfig,
+        )
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        ps = 128
+        budget = 512 * 1024**2  # 512 MiB
+        req_pool = ReqToTokenPool(
+            size=4, max_context_len=8192, device="cpu", enable_memory_saver=False
+        )
+
+        # Target: L_FA=4, L_SWA=12 (M_T=3), H_T=4, D_T=256, fp8
+        cases = [
+            # (name, spec_cfg, draft_kind)
+            (
+                "case2a_fa_only_bf16_draft",
+                SpecAuxHiddenStateConfig(
+                    draft_full_num_layers=6,
+                    draft_swa_num_layers=0,
+                    draft_full_bytes_per_token=TpuFusedMHATokenToKVPool.kv_bytes_per_token_per_layer(
+                        num_kv_heads=1,
+                        head_dim=64,
+                        v_head_dim=64,
+                        store_dtype=torch.bfloat16,
+                    ),
+                    draft_swa_bytes_per_token=0,
+                    draft_kv_heads_homogeneous=True,
+                    draft_kv_cache_dtype_str="bf16",
+                ),
+                "2a",
+            ),
+            (
+                "case2b_m_d_le_m_t",
+                SpecAuxHiddenStateConfig(
+                    draft_full_num_layers=2,
+                    draft_swa_num_layers=4,  # M_D=2 <= M_T=3
+                    draft_full_bytes_per_token=TpuFusedMHATokenToKVPool.kv_bytes_per_token_per_layer(
+                        num_kv_heads=1,
+                        head_dim=128,
+                        v_head_dim=128,
+                        store_dtype=torch.bfloat16,
+                    ),
+                    draft_swa_bytes_per_token=TpuFusedMHATokenToKVPool.kv_bytes_per_token_per_layer(
+                        num_kv_heads=1,
+                        head_dim=128,
+                        v_head_dim=128,
+                        store_dtype=torch.bfloat16,
+                    ),
+                    draft_kv_heads_homogeneous=True,
+                    draft_kv_cache_dtype_str="bf16",
+                ),
+                "2b_le",
+            ),
+            (
+                "case2b_m_d_gt_m_t",
+                SpecAuxHiddenStateConfig(
+                    draft_full_num_layers=1,
+                    draft_swa_num_layers=5,  # M_D=5 > M_T=3
+                    draft_full_bytes_per_token=TpuFusedMHATokenToKVPool.kv_bytes_per_token_per_layer(
+                        num_kv_heads=1,
+                        head_dim=128,
+                        v_head_dim=128,
+                        store_dtype=torch.bfloat16,
+                    ),
+                    draft_swa_bytes_per_token=TpuFusedMHATokenToKVPool.kv_bytes_per_token_per_layer(
+                        num_kv_heads=1,
+                        head_dim=128,
+                        v_head_dim=128,
+                        store_dtype=torch.bfloat16,
+                    ),
+                    draft_kv_heads_homogeneous=True,
+                    draft_kv_cache_dtype_str="bf16",
+                ),
+                "2b_gt",
+            ),
+            (
+                "case2c_swa_only",
+                SpecAuxHiddenStateConfig(
+                    draft_full_num_layers=0,
+                    draft_swa_num_layers=4,
+                    draft_full_bytes_per_token=0,
+                    draft_swa_bytes_per_token=TpuFusedMHATokenToKVPool.kv_bytes_per_token_per_layer(
+                        num_kv_heads=1,
+                        head_dim=64,
+                        v_head_dim=64,
+                        store_dtype=torch.bfloat16,
+                    ),
+                    draft_kv_heads_homogeneous=True,
+                    draft_kv_cache_dtype_str="bf16",
+                ),
+                "2c_swa",
+            ),
+            (
+                "case2c_inhomogeneous_mixed",
+                SpecAuxHiddenStateConfig(
+                    draft_full_num_layers=2,
+                    draft_swa_num_layers=3,
+                    draft_full_bytes_per_token=TpuFusedMHATokenToKVPool.kv_bytes_per_token_per_layer(
+                        num_kv_heads=4,
+                        head_dim=128,
+                        v_head_dim=128,
+                        store_dtype=torch.bfloat16,
+                    ),
+                    draft_swa_bytes_per_token=TpuFusedMHATokenToKVPool.kv_bytes_per_token_per_layer(
+                        num_kv_heads=1,
+                        head_dim=128,
+                        v_head_dim=128,
+                        store_dtype=torch.bfloat16,
+                    ),
+                    draft_kv_heads_homogeneous=False,
+                    draft_kv_cache_dtype_str="bf16",
+                ),
+                "2c_inhomo",
+            ),
+            (
+                "mtp_full_capacity",
+                SpecAuxHiddenStateConfig(
+                    draft_full_num_layers=1,
+                    draft_swa_num_layers=2,
+                    draft_swa_uses_full_capacity=True,
+                    draft_full_bytes_per_token=TpuFusedMHATokenToKVPool.kv_bytes_per_token_per_layer(
+                        num_kv_heads=2,
+                        head_dim=128,
+                        v_head_dim=128,
+                        store_dtype=torch.bfloat16,
+                    ),
+                    draft_swa_bytes_per_token=TpuFusedMHATokenToKVPool.kv_bytes_per_token_per_layer(
+                        num_kv_heads=2,
+                        head_dim=128,
+                        v_head_dim=128,
+                        store_dtype=torch.bfloat16,
+                    ),
+                    draft_kv_heads_homogeneous=True,
+                    draft_kv_cache_dtype_str="bf16",
+                ),
+                "mtp",
+            ),
+        ]
+
+        with self._cfg_patches(page_size=ps):
+            for name, spec_cfg, kind in cases:
+                with self.subTest(case=name):
+                    target_kvc = self._make_mock_kvc(
+                        full_ids=list(range(4)),
+                        swa_ids=list(range(4, 16)),
+                        head_num=4,
+                        head_dim=256,
+                        swa_head_num=4,
+                        swa_head_dim=256,
+                        dtype=torch.float8_e4m3fn,
+                    )
+                    target_kvc.spec_algorithm = SpeculativeAlgorithm.DFLASH
+                    target_kvc.spec_aux_config = spec_cfg
+                    conf = TpuUnifiedSWAPoolConfigurator(target_kvc)
+                    sizes = conf.calculate_pool_sizes(budget, page_size=ps)
+                    n_t = sizes.full_max_total_num_tokens // ps
+                    self.assertGreater(n_t, 0)
+                    # Exact binary-search optimality: n_t fits, next aligned step exceeds budget!
+                    self.assertLessEqual(
+                        conf._total_bytes_for_target_pages(n_t, ps), budget
+                    )
+                    self.assertGreater(
+                        conf._total_bytes_for_target_pages(
+                            n_t + conf._align_pages, ps
+                        ),
+                        budget,
+                    )
+
+                    target_pool = TpuUnifiedSWAKVPool(
+                        size=sizes.full_max_total_num_tokens,
+                        page_size=ps,
+                        dtype=torch.float8_e4m3fn,
+                        full=AttnLayerSpec(head_num=4, head_dim=256, layer_ids=range(4)),
+                        swa=AttnLayerSpec(
+                            head_num=4, head_dim=256, layer_ids=range(4, 16)
+                        ),
+                        device="cpu",
+                    )
+                    alloc = TpuUnifiedSWATokenToKVPoolAllocator(
+                        size=sizes.full_max_total_num_tokens,
+                        page_size=ps,
+                        dtype=torch.float8_e4m3fn,
+                        device="cpu",
+                        kvcache=target_pool,
+                        need_sort=False,
+                        req_to_token_pool=req_pool,
+                    )
+
+                    if kind == "2a":
+                        draft_kvc = self._make_mock_kvc(
+                            full_ids=list(range(6)),
+                            swa_ids=[],
+                            head_num=1,
+                            head_dim=64,
+                            dtype=torch.bfloat16,
+                        )
+                        draft_kvc.is_hybrid_swa = False
+                        draft_kvc.is_draft_worker = True
+                        derived = alloc.derive_draft_pool_sizes(
+                            draft_kvc,
+                            dict(
+                                max_total_num_tokens=sizes.max_total_num_tokens,
+                                full_max_total_num_tokens=sizes.full_max_total_num_tokens,
+                                swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
+                            ),
+                        )
+                        # Case 2a MUST cover all n_t * ps physical FA IDs, not just max_request_tokens!
+                        self.assertEqual(
+                            derived["max_total_num_tokens"],
+                            sizes.full_max_total_num_tokens,
+                        )
+                        draft_pool = TpuFusedMHATokenToKVPool(
+                            size=derived["max_total_num_tokens"],
+                            page_size=ps,
+                            dtype=torch.bfloat16,
+                            head_num=1,
+                            head_dim=64,
+                            layer_num=6,
+                            device="cpu",
+                            enable_memory_saver=False,
+                        )
+                    elif kind in ("2b_le", "2b_gt"):
+                        f_n = spec_cfg.draft_full_num_layers
+                        s_n = spec_cfg.draft_swa_num_layers
+                        draft_kvc = self._make_mock_kvc(
+                            full_ids=list(range(f_n)),
+                            swa_ids=list(range(f_n, f_n + s_n)),
+                            head_num=1,
+                            head_dim=128,
+                            swa_head_num=1,
+                            swa_head_dim=128,
+                            dtype=torch.bfloat16,
+                        )
+                        draft_kvc.is_draft_worker = True
+                        draft_kvc.draft_swa_full_capacity = False
+                        derived = alloc.derive_draft_pool_sizes(draft_kvc, {})
+                        draft_pool = TpuUnifiedSWAKVPool(
+                            size=derived["full_max_total_num_tokens"],
+                            page_size=ps,
+                            dtype=torch.bfloat16,
+                            full=AttnLayerSpec(
+                                head_num=1, head_dim=128, layer_ids=range(f_n)
+                            ),
+                            swa=AttnLayerSpec(
+                                head_num=1,
+                                head_dim=128,
+                                layer_ids=range(f_n, f_n + s_n),
+                            ),
+                            device="cpu",
+                        )
+                    elif kind == "2c_swa":
+                        draft_kvc = self._make_mock_kvc(
+                            full_ids=[],
+                            swa_ids=[0, 1, 2, 3],
+                            head_num=1,
+                            head_dim=64,
+                            swa_head_num=1,
+                            swa_head_dim=64,
+                            dtype=torch.bfloat16,
+                        )
+                        draft_kvc.is_draft_worker = True
+                        draft_kvc.draft_swa_full_capacity = False
+                        derived = alloc.derive_draft_pool_sizes(draft_kvc, {})
+                        draft_pool = SWAKVPool(
+                            size=derived["full_max_total_num_tokens"],
+                            size_swa=derived["swa_max_total_num_tokens"],
+                            page_size=ps,
+                            dtype=torch.bfloat16,
+                            head_num=1,
+                            head_dim=64,
+                            swa_attention_layer_ids=[0, 1, 2, 3],
+                            full_attention_layer_ids=[],
+                            device="cpu",
+                            token_to_kv_pool_class=TpuFusedMHATokenToKVPool,
+                        )
+                    elif kind == "2c_inhomo":
+                        draft_kvc = self._make_mock_kvc(
+                            full_ids=[0, 1],
+                            swa_ids=[2, 3, 4],
+                            head_num=4,
+                            head_dim=128,
+                            swa_head_num=1,
+                            swa_head_dim=128,
+                            dtype=torch.bfloat16,
+                        )
+                        draft_kvc.is_draft_worker = True
+                        draft_kvc.draft_swa_full_capacity = False
+                        derived = alloc.derive_draft_pool_sizes(draft_kvc, {})
+                        draft_pool = SWAKVPool(
+                            size=derived["full_max_total_num_tokens"],
+                            size_swa=derived["swa_max_total_num_tokens"],
+                            page_size=ps,
+                            dtype=torch.bfloat16,
+                            head_num=4,
+                            head_dim=128,
+                            swa_attention_layer_ids=[2, 3, 4],
+                            full_attention_layer_ids=[0, 1],
+                            device="cpu",
+                            token_to_kv_pool_class=TpuFusedMHATokenToKVPool,
+                            swa_kv_pool_kwargs=dict(
+                                page_size=ps,
+                                enable_memory_saver=False,
+                                device="cpu",
+                                head_num=1,
+                                head_dim=128,
+                                allocation_label="SWA",
+                            ),
+                        )
+                    else:
+                        draft_kvc = self._make_mock_kvc(
+                            full_ids=[0],
+                            swa_ids=[1, 2],
+                            head_num=2,
+                            head_dim=128,
+                            swa_head_num=2,
+                            swa_head_dim=128,
+                            dtype=torch.bfloat16,
+                        )
+                        draft_kvc.is_draft_worker = True
+                        draft_kvc.draft_swa_full_capacity = True
+                        derived = alloc.derive_draft_pool_sizes(draft_kvc, {})
+                        draft_pool = SWAKVPool(
+                            size=derived["full_max_total_num_tokens"],
+                            size_swa=derived["swa_max_total_num_tokens"],
+                            page_size=ps,
+                            dtype=torch.bfloat16,
+                            head_num=2,
+                            head_dim=128,
+                            swa_attention_layer_ids=[1, 2],
+                            full_attention_layer_ids=[0],
+                            device="cpu",
+                            token_to_kv_pool_class=TpuFusedMHATokenToKVPool,
+                        )
+
+                    combined_bytes = sum(target_pool.get_kv_size_bytes()) + sum(
+                        draft_pool.get_kv_size_bytes()
+                    )
+                    self.assertEqual(
+                        combined_bytes,
+                        conf._total_bytes_for_target_pages(n_t, ps),
+                    )
+                    self.assertLessEqual(combined_bytes, budget)
+
+    def test_case2b_coupled_allocator_lifecycle_m_d_le_and_gt_m_t(self):
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang_tpu.kv_free_fence import install_kv_free_fence
+        from sglang_tpu.unified_kv_pool import draft_case2b_num_pages
+
+        ps = 4
+        n_t = 24
+        req_pool = ReqToTokenPool(
+            size=4, max_context_len=128, device="cpu", enable_memory_saver=False
+        )
+
+        # Subcase A: M_T=3, M_D=2 (M_D <= M_T, zero extra overflow pages)
+        # Subcase B: M_T=2, M_D=4 (M_D > M_T, overflow pages in [n_t + 1 .. n_d])
+        # Subcase C: M_T=1, M_D=3 (Target has _group_pages=None, Draft has 2 overflow groups!)
+        for label, t_full, t_swa, d_full, d_swa in (
+            ("m_d_le_m_t", [0, 1], [2, 3, 4, 5, 6, 7], [0, 1], [2, 3, 4, 5]),
+            ("m_d_gt_m_t", [0, 1], [2, 3, 4, 5], [0], [1, 2, 3, 4]),
+            ("m_t_1_m_d_3", [0, 1], [2, 3], [0], [1, 2, 3]),
+        ):
+            with self.subTest(case=label):
+                target_pool = TpuUnifiedSWAKVPool(
+                    size=n_t * ps,
+                    page_size=ps,
+                    dtype=torch.bfloat16,
+                    full=AttnLayerSpec(head_num=2, head_dim=128, layer_ids=t_full),
+                    swa=AttnLayerSpec(head_num=2, head_dim=128, layer_ids=t_swa),
+                    device="cpu",
+                )
+                alloc = TpuUnifiedSWATokenToKVPoolAllocator(
+                    size=n_t * ps,
+                    page_size=ps,
+                    dtype=torch.bfloat16,
+                    device="cpu",
+                    kvcache=target_pool,
+                    need_sort=False,
+                    req_to_token_pool=req_pool,
+                )
+                m_t = target_pool.layout.num_swa_groups
+                m_d = num_swa_groups(len(d_full), len(d_swa))
+                n_d = draft_case2b_num_pages(n_t, m_t, m_d)
+                draft_pool = TpuUnifiedSWAKVPool(
+                    size=n_d * ps,
+                    page_size=ps,
+                    dtype=torch.bfloat16,
+                    full=AttnLayerSpec(head_num=1, head_dim=64, layer_ids=d_full),
+                    swa=AttnLayerSpec(head_num=1, head_dim=64, layer_ids=d_swa),
+                    device="cpu",
+                )
+                # Install fence BEFORE attach on m_d_gt_m_t and AFTER attach on m_t_1_m_d_3
+                # to exercise both initialization orders in KVFreeFence!
+                if label == "m_d_gt_m_t":
+                    fence = install_kv_free_fence(
+                        alloc,
+                        synchronize_device=lambda: None,
+                        spec_algorithm=SpeculativeAlgorithm.EAGLE3,
+                        copies_draft_tail=True,
+                    )
+                alloc.attach_draft_kv_pool(draft_pool)
+                if label != "m_d_gt_m_t":
+                    fence = install_kv_free_fence(
+                        alloc,
+                        synchronize_device=lambda: None,
+                        spec_algorithm=SpeculativeAlgorithm.EAGLE3,
+                        copies_draft_tail=True,
+                    )
+
+                self.assertIs(
+                    draft_pool.full_to_swa_index_mapping,
+                    alloc.full_to_swa_index_mapping,
+                )
+
+                # 1) alloc_extend 2 pages (8 tokens) + alloc_extend_swa_tail (12 tokens, tail 4)
+                out1 = alloc.alloc_extend(
+                    prefix_lens=torch.tensor([0]),
+                    prefix_lens_cpu=torch.tensor([0]),
+                    seq_lens=torch.tensor([8]),
+                    seq_lens_cpu=torch.tensor([8]),
+                    last_loc=torch.tensor([-1]),
+                    extend_num_tokens=8,
+                )
+                out2 = alloc.alloc_extend_swa_tail(
+                    prefix_lens=torch.tensor([0]),
+                    prefix_lens_cpu=torch.tensor([0]),
+                    seq_lens=torch.tensor([12]),
+                    seq_lens_cpu=torch.tensor([12]),
+                    last_loc=torch.tensor([-1]),
+                    extend_num_tokens=12,
+                    swa_tail_len=4,
+                )
+                # 2) alloc_decode crossing into a new page on out1 (len 8 -> 9)
+                dec1 = alloc.alloc_decode(
+                    seq_lens=torch.tensor([9]),
+                    seq_lens_cpu=torch.tensor([9]),
+                    last_loc=out1[-1:],
+                )
+
+                # Collect ALL active draft physical pages across FA + all M_D SWA groups
+                active_fa_toks = torch.cat([out1, dec1, out2])
+                fa_pages = set((active_fa_toks[::ps] // ps).tolist())
+                swa_base_toks = draft_pool.translate_loc_from_full_to_swa(
+                    active_fa_toks
+                )
+                valid_swa_base = swa_base_toks[swa_base_toks > 0]
+                swa_base_pages = sorted(set((valid_swa_base // ps).tolist()))
+                self.assertEqual(len(swa_base_pages), 4)  # 3 pages from req1 + 1 tail page from req2
+
+                all_draft_pages = list(fa_pages)
+                for bp in swa_base_pages:
+                    all_draft_pages.append(bp)
+                    for g in range(1, m_d):
+                        comp = int(draft_pool.swa_group_pages[g - 1, bp])
+                        self.assertGreater(comp, 0)
+                        if g < m_t:
+                            self.assertEqual(
+                                comp, int(target_pool.swa_group_pages[g - 1, bp])
+                            )
+                            self.assertLessEqual(comp, n_t)
+                        else:
+                            self.assertGreater(comp, n_t)
+                            self.assertLessEqual(comp, n_d)
+                        all_draft_pages.append(comp)
+                # ZERO physical page aliasing across FA + all M_D SWA groups!
+                self.assertEqual(len(all_draft_pages), len(set(all_draft_pages)))
+
+                # 3) Fence hold + release across both Target and overflow sidecar!
+                fwd_res = SimpleNamespace(copy_done=None)
+                fence.on_batch_formed()
+                fence.on_forward_launched(fwd_res)
+                alloc.free_swa(out2[-4:])
+                alloc.free_full(out2)
+                alloc.free_group_begin()
+                alloc.free_swa(torch.cat([out1, dec1]))
+                alloc.free_full(torch.cat([out1, dec1]))
+                alloc.free_group_end()
+                if alloc._draft_sidecar_allocator is not None:
+                    self.assertGreater(
+                        alloc._draft_sidecar_allocator.held_pages.num_pages, 0
+                    )
+                fence.on_forward_done(fwd_res)
+                self.assertEqual(alloc.full_available_size(), n_t * ps)
+                if alloc._draft_sidecar_allocator is not None:
+                    self.assertEqual(
+                        alloc._draft_sidecar_allocator.available_size(),
+                        (n_d - n_t) * ps,
+                    )
+                    self.assertEqual(
+                        int(draft_pool.swa_group_pages.abs().sum().item()), 0
+                    )
+
+    def test_case2c_sidecar_lifecycle_swa_only_and_mixed_swakvpool(self):
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang_tpu.kv_free_fence import install_kv_free_fence
+        from sglang_tpu.unified_kv_pool import draft_case2c_swa_num_pages
+
+        ps = 4
+        n_t = 20
+        req_pool = ReqToTokenPool(
+            size=4, max_context_len=128, device="cpu", enable_memory_saver=False
+        )
+
+        for full_ids, swa_ids, t_swa_ids in (
+            ([], [0, 1, 2], [2, 3, 4, 5, 6, 7]),  # SWA-only draft, M_T=3
+            ([0], [1, 2], [2, 3]),  # Mixed inhomogeneous draft, M_T=1
+        ):
+            with self.subTest(full_ids=full_ids, t_swa_len=len(t_swa_ids)):
+                target_pool = TpuUnifiedSWAKVPool(
+                    size=n_t * ps,
+                    page_size=ps,
+                    dtype=torch.bfloat16,
+                    full=AttnLayerSpec(head_num=2, head_dim=128, layer_ids=[0, 1]),
+                    swa=AttnLayerSpec(head_num=2, head_dim=128, layer_ids=t_swa_ids),
+                    device="cpu",
+                )
+                alloc = TpuUnifiedSWATokenToKVPoolAllocator(
+                    size=n_t * ps,
+                    page_size=ps,
+                    dtype=torch.bfloat16,
+                    device="cpu",
+                    kvcache=target_pool,
+                    need_sort=False,
+                    req_to_token_pool=req_pool,
+                )
+                m_t = target_pool.layout.num_swa_groups
+                n_d_swa = draft_case2c_swa_num_pages(n_t, m_t)
+                draft_pool = SWAKVPool(
+                    size=n_t * ps,
+                    size_swa=n_d_swa * ps,
+                    page_size=ps,
+                    dtype=torch.bfloat16,
+                    head_num=4,
+                    head_dim=64,
+                    swa_attention_layer_ids=swa_ids,
+                    full_attention_layer_ids=full_ids,
+                    device="cpu",
+                    token_to_kv_pool_class=TpuFusedMHATokenToKVPool,
+                    swa_kv_pool_kwargs=dict(
+                        page_size=ps,
+                        enable_memory_saver=False,
+                        device="cpu",
+                        head_num=1,
+                        head_dim=64,
+                        allocation_label="SWA",
+                    ),
+                )
+                fence = install_kv_free_fence(
+                    alloc,
+                    synchronize_device=lambda: None,
+                    spec_algorithm=SpeculativeAlgorithm.EAGLE3,
+                    copies_draft_tail=True,
+                )
+                alloc.attach_draft_kv_pool(draft_pool)
+                self.assertIn(alloc._draft_sidecar_allocator, fence._allocators)
+
+                self.assertIsNotNone(alloc.draft_full_to_swa_index_mapping)
+                self.assertIs(
+                    draft_pool.full_to_swa_index_mapping,
+                    alloc.draft_full_to_swa_index_mapping,
+                )
+                self.assertIsNot(
+                    draft_pool.full_to_swa_index_mapping,
+                    alloc.full_to_swa_index_mapping,
+                )
+                self.assertLessEqual(alloc.swa_available_size(), n_d_swa * ps)
+                self.assertFalse(alloc.new_pages_available(1, n_d_swa + 1))
+
+                # Allocate 2 pages via alloc_extend + 3 pages (tail 1 page) via alloc_extend_swa_tail
+                out1 = alloc.alloc_extend(
+                    prefix_lens=torch.tensor([0]),
+                    prefix_lens_cpu=torch.tensor([0]),
+                    seq_lens=torch.tensor([6]),
+                    seq_lens_cpu=torch.tensor([6]),
+                    last_loc=torch.tensor([-1]),
+                    extend_num_tokens=6,
+                )
+                # Decode within page (6 -> 7) and across page boundary (8 -> 9)
+                dec1 = alloc.alloc_decode(
+                    seq_lens=torch.tensor([7]),
+                    seq_lens_cpu=torch.tensor([7]),
+                    last_loc=out1[-1:],
+                )
+                dec2 = alloc.alloc_decode(
+                    seq_lens=torch.tensor([8]),
+                    seq_lens_cpu=torch.tensor([8]),
+                    last_loc=dec1,
+                )
+                dec3 = alloc.alloc_decode(
+                    seq_lens=torch.tensor([9]),
+                    seq_lens_cpu=torch.tensor([9]),
+                    last_loc=dec2,
+                )
+                req1_toks = torch.cat([out1, dec1, dec2, dec3])
+                out2 = alloc.alloc_extend_swa_tail(
+                    prefix_lens=torch.tensor([0]),
+                    prefix_lens_cpu=torch.tensor([0]),
+                    seq_lens=torch.tensor([12]),
+                    seq_lens_cpu=torch.tensor([12]),
+                    last_loc=torch.tensor([-1]),
+                    extend_num_tokens=12,
+                    swa_tail_len=4,
+                )
+
+                # Check req2 prefix (first 8 tokens) is unmapped (0) in BOTH mappings,
+                # while tail (last 4 tokens) maps into compact [1 .. n_d_swa * ps]!
+                d_swa_out2 = draft_pool.translate_loc_from_full_to_swa(out2)
+                self.assertTrue(torch.all(d_swa_out2[:8] == 0))
+                self.assertTrue(torch.all(d_swa_out2[8:] > 0))
+                self.assertTrue(torch.all(d_swa_out2[8:] <= n_d_swa * ps))
+
+                d_swa_req1 = draft_pool.translate_loc_from_full_to_swa(req1_toks)
+                self.assertTrue(torch.all(d_swa_req1 > 0))
+                self.assertTrue(torch.all(d_swa_req1 <= n_d_swa * ps))
+                # Page-offset alignment preserved between FA and compact draft SWA!
+                self.assertTrue(
+                    torch.equal(req1_toks % ps, d_swa_req1.to(req1_toks.dtype) % ps)
+                )
+
+                # Translate Target SWA pages -> Draft SWA pages
+                t_swa_req1 = target_pool.translate_loc_from_full_to_swa(req1_toks)
+                t_pages = (t_swa_req1[::ps] // ps).to(torch.long)
+                d_pages = alloc.translate_target_swa_pages_to_draft(t_pages)
+                self.assertEqual(
+                    d_pages.tolist(), (d_swa_req1[::ps] // ps).tolist()
+                )
+                self.assertEqual(len(set(d_pages.tolist())), 3)
+
+                # Free SWA on req1 first page and verify both mappings clear to 0
+                alloc.free_swa(req1_toks[:ps])
+                self.assertTrue(
+                    torch.all(
+                        draft_pool.translate_loc_from_full_to_swa(req1_toks[:ps]) == 0
+                    )
+                )
+                self.assertEqual(
+                    int(alloc.translate_target_swa_pages_to_draft(t_pages[:1])[0]), 0
+                )
+
+                # Clear resets Target, sidecar, target_swa_to_draft_swa, and draft mapping
+                alloc.clear()
+                self.assertEqual(
+                    alloc._draft_sidecar_allocator.available_size(), n_d_swa * ps
+                )
+                self.assertEqual(
+                    int(alloc.target_swa_to_draft_swa.abs().sum().item()), 0
+                )
+                self.assertEqual(
+                    int(alloc.draft_full_to_swa_index_mapping[:-1].abs().sum().item()),
+                    0,
+                )
+                self.assertEqual(int(alloc.draft_full_to_swa_index_mapping[-1]), -1)
+
+    def test_multi_group_draft_kv_spans_mapping_and_writer_parity(self):
+        import torch.nn.functional as F
+        from torch import nn
+
+        from sglang_tpu.compilation.spec_decode_compile_policy_dflash import (
+            DFlashSpecDecodeCompilePolicyMixin,
+        )
+        from sglang_tpu.dflash_draft_kv_write import (
+            dflash_write_draft_kv_ref,
+            draft_kv_has_swa,
+            draft_kv_num_addr_groups,
+            get_contiguous_slot_spans,
+            map_draft_kv_locs,
+        )
+        from sglang_tpu.kv_fused_rope_write import fused_rope_write_kv_ref
+
+        torch.manual_seed(7)
+        ps = 8
+
+        # 1) Test _extend_spans with leading, interior, and trailing 0s + multi-group SWA (-1 prefix)
+        fa_loc = torch.tensor(
+            [0, 0, 8, 9, 10, 0, 16, 17, 18, 19, 0, 0], dtype=torch.int64
+        )
+        swa_g1 = torch.tensor(
+            [-1, -1, -1, -1, -1, -1, 40, 41, 42, 43, -1, -1], dtype=torch.int64
+        )
+        swa_g2 = torch.tensor(
+            [-1, -1, -1, -1, -1, -1, 56, 57, 58, 59, -1, -1], dtype=torch.int64
+        )
+        loc_2d = torch.stack([fa_loc, swa_g1, swa_g2], dim=0)
+        dst, src, lens, max_len = get_contiguous_slot_spans(
+            page_size=ps,
+            cache_loc=loc_2d,
+            cache_loc_2d=None,
+            commit_lens=None,
+            max_num_reqs=4,
+        )
+        self.assertEqual(max_len, ps)
+        self.assertEqual(dst.shape[0], 3)
+        non_empty = torch.nonzero(lens > 0, as_tuple=False).squeeze(-1).tolist()
+        self.assertEqual([int(src[i]) for i in non_empty], [2, 6])
+        self.assertEqual([int(lens[i]) for i in non_empty], [3, 4])
+        self.assertEqual([int(dst[0, i]) for i in non_empty], [8, 16])
+        self.assertEqual([int(dst[1, i]) for i in non_empty], [-1, 40])
+        self.assertEqual([int(dst[2, i]) for i in non_empty], [-1, 56])
+
+        # 2) Verify span-driven multi-buffer / multi-group write matches fused_rope_write_kv_ref
+        #    on a Case 2b unified pool (L_FA=2, L_SWA=5 -> B=2 shared buffers, M_D=3 -> G=4)
+        draft_unified = TpuUnifiedSWAKVPool(
+            size=16 * ps,
+            page_size=ps,
+            dtype=torch.float32,
+            full=AttnLayerSpec(head_num=2, head_dim=16, layer_ids=[0, 3]),
+            swa=AttnLayerSpec(head_num=2, head_dim=16, layer_ids=[1, 2, 4, 5, 6]),
+            device="cpu",
+        )
+        mapping = torch.zeros(16 * ps + ps + 1, dtype=torch.int64)
+        mapping[-1] = -1
+        # Page 2 (16..23) -> base SWA page 5 (40..47), companion pages [8, 11]
+        # Page 1 (8..15) is evicted in SWA (0 in mapping)
+        mapping[2 * ps : 3 * ps] = torch.arange(5 * ps, 6 * ps)
+        draft_unified.register_mapping(mapping)
+        draft_unified.swa_group_pages[:, 5] = torch.tensor([8, 11], dtype=torch.int32)
+
+        self.assertTrue(draft_kv_has_swa(draft_unified))
+        self.assertEqual(draft_kv_num_addr_groups(draft_unified), 4)
+
+        full_extend = torch.tensor(
+            [0, 8, 9, 10, 0, 16, 17, 18, 0], dtype=torch.int64
+        )
+        mapped_extend = map_draft_kv_locs(draft_unified, full_extend)
+        self.assertEqual(mapped_extend.shape, (4, 9))
+        self.assertEqual(mapped_extend[0].tolist(), [0, 8, 9, 10, 0, 16, 17, 18, 0])
+        self.assertEqual(
+            mapped_extend[1].tolist(), [-1, -1, -1, -1, -1, 40, 41, 42, -1]
+        )
+        self.assertEqual(
+            mapped_extend[2].tolist(), [-1, -1, -1, -1, -1, 64, 65, 66, -1]
+        )
+        self.assertEqual(
+            mapped_extend[3].tolist(), [-1, -1, -1, -1, -1, 88, 89, 90, -1]
+        )
+
+        num_layers = 7
+        num_tokens = int(full_extend.shape[0])
+        k = torch.randn(num_layers, num_tokens, 2, 16)
+        v = torch.randn(num_layers, num_tokens, 2, 16)
+        cos = torch.randn(num_tokens, 8)
+        sin = torch.randn(num_tokens, 8)
+        l2b = tuple(draft_unified._buffer_idx(lid) for lid in range(num_layers))
+        l2g = tuple(
+            0
+            if not draft_unified.layers_mapping[lid][1]
+            else 1 + draft_unified.swa_page_group(lid)
+            for lid in range(num_layers)
+        )
+
+        ref_bufs = [b.clone() for b in draft_unified.kv_pool.kv_buffer]
+        span_bufs = [b.clone() for b in draft_unified.kv_pool.kv_buffer]
+        fused_rope_write_kv_ref(
+            loc=mapped_extend,
+            k=k,
+            v=v,
+            cos=cos,
+            sin=sin,
+            kv_bufs=ref_bufs,
+            layer_to_buf=l2b,
+            layer_to_addr_group=l2g,
+        )
+        # Replay exact kernel span-table write semantics on span_bufs:
+        e_dst, e_src, e_lens, _ = get_contiguous_slot_spans(
+            page_size=ps,
+            cache_loc=mapped_extend,
+            cache_loc_2d=None,
+            commit_lens=None,
+            max_num_reqs=4,
+        )
+        for s_idx in range(int(e_lens.shape[0])):
+            n_s = int(e_lens[s_idx])
+            if n_s <= 0:
+                continue
+            st = int(e_src[s_idx])
+            sub_loc = torch.stack(
+                [
+                    (
+                        torch.arange(int(e_dst[g, s_idx]), int(e_dst[g, s_idx]) + n_s)
+                        if int(e_dst[g, s_idx]) >= 0
+                        else torch.full((n_s,), -1, dtype=torch.long)
+                    )
+                    for g in range(4)
+                ],
+                dim=0,
+            )
+            fused_rope_write_kv_ref(
+                loc=sub_loc,
+                k=k[:, st : st + n_s],
+                v=v[:, st : st + n_s],
+                cos=cos[st : st + n_s],
+                sin=sin[st : st + n_s],
+                kv_bufs=span_bufs,
+                layer_to_buf=l2b,
+                layer_to_addr_group=l2g,
+            )
+        for b_idx in range(len(ref_bufs)):
+            torch.testing.assert_close(span_bufs[b_idx], ref_bufs[b_idx])
+            # Slot 0 (dummy page 0, offset 0) must remain completely untouched!
+            self.assertEqual(float(span_bufs[b_idx][0, 0].abs().sum().item()), 0.0)
+
+        # 3) Test 3D _verify_spans across page boundaries + pad_append_target_hidden_tpu
+        # Row 0 crosses page 2 -> page 3 at offset 6 (22, 23, 24, 25), commit_len=3;
+        # Row 1 commits 0 tokens.
+        mapping[3 * ps : 4 * ps] = torch.arange(6 * ps, 7 * ps)
+        draft_unified.swa_group_pages[:, 6] = torch.tensor([9, 12], dtype=torch.int32)
+        fa_verify_2d = torch.tensor(
+            [[22, 23, 24, 25], [16, 17, 18, 19]], dtype=torch.int64
+        )
+        mapped_verify_3d = map_draft_kv_locs(draft_unified, fa_verify_2d)
+        self.assertEqual(mapped_verify_3d.shape, (4, 2, 4))
+
+        policy = object.__new__(DFlashSpecDecodeCompilePolicyMixin)
+        policy.b_bucketer = types.SimpleNamespace(next_bucket=lambda bs: 4)
+        policy.t_bucketer = types.SimpleNamespace(next_bucket=lambda t: 16)
+        policy.model_runner = types.SimpleNamespace(token_to_kv_pool=draft_unified)
+        padded = policy.pad_append_target_hidden_tpu(
+            target_hidden=torch.zeros((8, 32)),
+            cache_loc=mapped_verify_3d.reshape(4, -1),
+            positions=torch.arange(8, dtype=torch.int64),
+            cache_loc_2d=mapped_verify_3d,
+            commit_lens=torch.tensor([3, 0], dtype=torch.int32),
+        )
+        assert padded is not None
+        _, p_loc, _, p_loc2d, p_commits = padded
+        self.assertEqual(p_loc.shape, (4, 16))
+        self.assertEqual(p_loc2d.shape, (4, 4, 4))
+        self.assertTrue(torch.all(p_loc[0, 8:] == 0))
+        self.assertTrue(torch.all(p_loc[1:, 8:] == -1))
+        self.assertTrue(torch.all(p_loc2d[0, 2:] == 0))
+        self.assertTrue(torch.all(p_loc2d[1:, 2:] == -1))
+
+        v_dst, v_src, v_lens, v_max = get_contiguous_slot_spans(
+            page_size=ps,
+            cache_loc=p_loc,
+            cache_loc_2d=p_loc2d,
+            commit_lens=p_commits,
+            max_num_reqs=4,
+        )
+        self.assertEqual(v_max, 4)
+        self.assertEqual(v_dst.shape, (4, 8))
+        # Request 0 split into head_len=2 (22, 23) + tail_len=1 (24); rows 1..3 have 0 lens
+        self.assertEqual(v_lens.tolist(), [2, 0, 0, 0, 1, 0, 0, 0])
+        self.assertEqual(v_src.tolist(), [0, 4, 8, 12, 2, 4, 8, 12])
+        self.assertEqual(
+            [int(v_dst[g, 0]) for g in range(4)], [22, 46, 70, 94]
+        )
+        self.assertEqual(
+            [int(v_dst[g, 4]) for g in range(4)], [24, 48, 72, 96]
+        )
+
+        # 4) Verify dflash_write_draft_kv_ref on inhomogeneous mixed SWAKVPool (Case 2c)
+        class _MiniAttn(nn.Module):
+            def __init__(self, lid: int, heads: int, dim: int):
+                super().__init__()
+                self.attn = types.SimpleNamespace(layer_id=lid)
+                self.num_kv_heads = heads
+                self.head_dim = dim
+                self.w = nn.Linear(16, 2 * heads * dim, bias=False)
+
+            def kv_proj_only(self, h):
+                return self.w(h).chunk(2, dim=-1)
+
+            def apply_k_norm(self, k_in):
+                return k_in
+
+            def apply_k_rope(self, pos, k_in):
+                del pos
+                return k_in
+
+        class _MiniDraft(nn.Module):
+            def __init__(self):
+                super().__init__()
+                l0, l1 = nn.Module(), nn.Module()
+                l0.self_attn = _MiniAttn(0, heads=2, dim=16)
+                l1.self_attn = _MiniAttn(1, heads=1, dim=16)
+                self.layers = nn.ModuleList([l0, l1])
+
+            def prepare_context_hidden_for_kv(self, layer, h):
+                del layer
+                return h
+
+        mixed_swa_pool = SWAKVPool(
+            size=4 * ps,
+            size_swa=3 * ps,
+            page_size=ps,
+            dtype=torch.float32,
+            head_num=2,
+            head_dim=16,
+            swa_attention_layer_ids=[1],
+            full_attention_layer_ids=[0],
+            device="cpu",
+            token_to_kv_pool_class=TpuFusedMHATokenToKVPool,
+            swa_kv_pool_kwargs=dict(
+                page_size=ps,
+                enable_memory_saver=False,
+                device="cpu",
+                head_num=1,
+                head_dim=16,
+                allocation_label="SWA",
+            ),
+        )
+        m2c = torch.zeros(4 * ps + ps + 1, dtype=torch.int64)
+        m2c[-1] = -1
+        m2c[2 * ps : 3 * ps] = torch.arange(1 * ps, 2 * ps)
+        mixed_swa_pool.register_mapping(m2c)
+        locs_2c = map_draft_kv_locs(
+            mixed_swa_pool, torch.tensor([8, 9, 16, 17], dtype=torch.int64)
+        )
+        self.assertEqual(locs_2c.tolist(), [[8, 9, 16, 17], [-1, -1, 8, 9]])
+        mini_draft = _MiniDraft()
+        ctx_h = torch.randn(4, 16)
+        dflash_write_draft_kv_ref(
+            draft_model=mini_draft,
+            kv_pool=mixed_swa_pool,
+            ctx_hidden=ctx_h,
+            ctx_positions=torch.arange(4, dtype=torch.int64),
+            ctx_cache_loc=locs_2c,
+        )
+        # Full layer wrote both page 1 (8, 9) and page 2 (16, 17); SWA layer wrote only (8, 9)!
+        self.assertGreater(
+            float(mixed_swa_pool.full_kv_pool.kv_buffer[0][1, :2].detach().abs().sum()),
+            0.0,
+        )
+        self.assertGreater(
+            float(mixed_swa_pool.full_kv_pool.kv_buffer[0][2, :2].detach().abs().sum()),
+            0.0,
+        )
+        self.assertGreater(
+            float(mixed_swa_pool.swa_kv_pool.kv_buffer[0][1, :2].detach().abs().sum()),
+            0.0,
+        )
+        self.assertEqual(
+            float(mixed_swa_pool.swa_kv_pool.kv_buffer[0][0].detach().abs().sum()), 0.0
         )
 
 

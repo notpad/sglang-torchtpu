@@ -40,6 +40,11 @@ from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolic
 from sglang_tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
 )
+from sglang_tpu.dflash_draft_kv_write import (
+    draft_kv_has_swa,
+    draft_kv_num_addr_groups,
+    map_draft_kv_locs,
+)
 from sglang_tpu.experimental.speculative.base_spec_worker import (
     TpuSpecWorker,
 )
@@ -60,6 +65,7 @@ from sglang_tpu.experimental.speculative.dspark.dspark_draft_worker import (
 from sglang_tpu.experimental.speculative.spec_ops import (
     TARGET_CANDIDATES,
     build_draft_block_inputs,
+    select_verify_rows,
 )
 from sglang_tpu.experimental.speculative.spec_types import (
     AcceptResult,
@@ -70,7 +76,11 @@ from sglang_tpu.experimental.speculative.spec_types import (
     TpuSpecVerifyInput,
     VerifyRows,
 )
-from sglang_tpu.experimental.speculative.spec_utils import pad_rows, prompt_positions
+from sglang_tpu.experimental.speculative.spec_utils import (
+    pad_rows,
+    padded_h2d,
+    prompt_positions,
+)
 from sglang_tpu.sampler import distributed_top_k_candidate_width_for_model
 
 _DRAFT_WORKER_CLS: dict[SpeculativeAlgorithm, type[TpuBlockDraftWorker]] = {
@@ -202,19 +212,64 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         logits_output: LogitsProcessorOutput,
         accept: AcceptResult,
     ) -> CommitResult:
-        del verify_input
+        del batch
         target_hidden = logits_output.hidden_states
         assert target_hidden is not None
         assert target_hidden.shape[0] == rows.cache_locs.numel(), (
             "verify hidden must keep the batch bucket rows"
         )
+        draft_pool = self._draft_runner.token_to_kv_pool
+        write_cache_loc = rows.flat_cache_locs
+        write_cache_loc_2d = rows.cache_locs
+        if draft_kv_has_swa(draft_pool):
+            pbs = int(rows.cache_locs.shape[0])
+            num_groups = draft_kv_num_addr_groups(draft_pool)
+            if num_groups == 1:
+                # SWA-only draft: map the candidate window to SWA slots on host.
+                swa_candidates = map_draft_kv_locs(
+                    draft_pool, verify_input.verify_cache_candidates_cpu
+                )
+                swa_rows = select_verify_rows(
+                    padded_h2d(
+                        swa_candidates.to(torch.int64),
+                        pbs,
+                        self.device,
+                    ),
+                    verify_input.committed_lens,
+                    state.seq_lens,
+                    self.num_verify_rows,
+                )
+                write_cache_loc = swa_rows.flat_cache_locs
+                write_cache_loc_2d = swa_rows.cache_locs
+            else:
+                # Mixed FA+SWA draft (Case 2b unified or Case 2c SWAKVPool):
+                # map padded FA candidates to [G, pbs, 2 * cap] and gather each SWA group.
+                padded_fa_candidates = pad_rows(
+                    verify_input.verify_cache_candidates_cpu, pbs
+                )
+                mapped_candidates = map_draft_kv_locs(
+                    draft_pool, padded_fa_candidates
+                ).to(torch.int64)
+                locs_2d_groups = [rows.cache_locs]
+                locs_flat_groups = [rows.flat_cache_locs]
+                for g in range(1, num_groups):
+                    g_rows = select_verify_rows(
+                        mapped_candidates[g].to(self.device, non_blocking=True),
+                        verify_input.committed_lens,
+                        state.seq_lens,
+                        self.num_verify_rows,
+                    )
+                    locs_2d_groups.append(g_rows.cache_locs)
+                    locs_flat_groups.append(g_rows.flat_cache_locs)
+                write_cache_loc_2d = torch.stack(locs_2d_groups, dim=0)
+                write_cache_loc = torch.stack(locs_flat_groups, dim=0)
         # Padded rows commit 0 tokens, so the writer skips them.
         with self._block_draft_worker.draft_context():
             kv_fence_tail = self._block_draft_worker.write_draft_kv(
                 target_hidden=target_hidden,
                 positions=rows.flat_positions,
-                cache_loc=rows.flat_cache_locs,
-                cache_loc_2d=rows.cache_locs,
+                cache_loc=write_cache_loc,
+                cache_loc_2d=write_cache_loc_2d,
                 commit_lens=accept.accept_lens,
             )
         # Verify rows past the new seq_lens become dead target KV; freeing them is the allocator's job.
@@ -244,6 +299,12 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         # finalize keeps HOST_PADDED hidden at the token bucket; pad the host rows to
         # match and upload once. Padded rows write slot 0, like the target forward.
         padded_rows = target_hidden.shape[0]
+        draft_pool = self._draft_runner.token_to_kv_pool
+        num_groups = (
+            1
+            if self.ships_pd_hidden
+            else draft_kv_num_addr_groups(draft_pool)
+        )
         if not batch.reqs:
             # A DP-attention rank without prompts (DP padding relabels its batch)
             # still issues the draft KV write; all its rows are padding.
@@ -251,21 +312,32 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             assert isinstance(compile_policy, DecoderTpuCompilePolicy)
             positions_cpu = torch.zeros((padded_rows,), dtype=torch.int64)
             # The writer was warmed with the allocator's dtype; idle batches carry int64.
-            cache_loc_cpu = torch.zeros(
-                (padded_rows,), dtype=compile_policy.live_cache_loc_dtype()
-            )
+            loc_dtype = compile_policy.live_cache_loc_dtype()
+            if num_groups == 1:
+                cache_loc_cpu = torch.zeros((padded_rows,), dtype=loc_dtype)
+            else:
+                cache_loc_cpu = torch.cat(
+                    [
+                        torch.zeros((1, padded_rows), dtype=loc_dtype),
+                        torch.full((num_groups - 1, padded_rows), -1, dtype=loc_dtype),
+                    ],
+                    dim=0,
+                )
         else:
             positions_cpu = prompt_positions(
                 prefix_lens=batch.prefix_lens, extend_lens=batch.extend_lens
             )
-            cache_loc_cpu = batch.out_cache_loc
-            assert cache_loc_cpu.device.type == "cpu", cache_loc_cpu.device
+            fa_loc_cpu = batch.out_cache_loc
+            assert fa_loc_cpu.device.type == "cpu", fa_loc_cpu.device
+            padded_fa_loc = pad_rows(fa_loc_cpu, padded_rows)
+            if draft_kv_has_swa(draft_pool) and not self.ships_pd_hidden:
+                cache_loc_cpu = map_draft_kv_locs(draft_pool, padded_fa_loc)
+            else:
+                cache_loc_cpu = padded_fa_loc
         positions = pad_rows(positions_cpu, padded_rows).to(
             self.device, non_blocking=True
         )
-        cache_loc = pad_rows(cache_loc_cpu, padded_rows).to(
-            self.device, non_blocking=True
-        )
+        cache_loc = cache_loc_cpu.to(self.device, non_blocking=True)
         # Must inject before returning: the scheduler may update radix afterward,
         # invalidating out_cache_loc.
         if self.ships_pd_hidden:
@@ -312,6 +384,10 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         bonus_tokens: torch.Tensor,
     ) -> None:
         del bonus_tokens
+        if draft_kv_has_swa(self._draft_runner.token_to_kv_pool):
+            raise NotImplementedError(
+                "PD decode-side draft prefill does not support a hybrid-SWA draft."
+            )
         positions = pad_rows(
             prompt_positions(
                 prefix_lens=batch.prefix_lens, extend_lens=batch.extend_lens
@@ -403,6 +479,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
 
     def _warmup_draft_block_inputs(self) -> None:
         # Width and mask token come from the draft config, so the shared spec-op grid cannot warm it.
+        num_groups = draft_kv_num_addr_groups(self._draft_runner.token_to_kv_pool)
         with torch.no_grad():
             for width, padded_bs in itertools.product(
                 self.verify_widths(), self._bucket_sizes()
@@ -434,6 +511,27 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                     self._mask_token_id,
                     self._draft_block_width,
                 )
+                if num_groups > 1:
+                    torch.stack(
+                        [
+                            torch.zeros(
+                                block_shape, dtype=torch.int64, device=self.device
+                            )
+                            for _ in range(num_groups)
+                        ],
+                        dim=0,
+                    ).cpu()
+                    torch.stack(
+                        [
+                            torch.zeros(
+                                (padded_bs * width,),
+                                dtype=torch.int64,
+                                device=self.device,
+                            )
+                            for _ in range(num_groups)
+                        ],
+                        dim=0,
+                    ).cpu()
 
     def _warmup_draft_sampling(self) -> None:
         """The eager sampled-draft chain, plus step's verify-token cat and logits cast."""
@@ -486,12 +584,17 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         compile_policy = self.target_worker.model_runner.compile_policy
         assert isinstance(compile_policy, DecoderTpuCompilePolicy)
         assert compile_policy.t_bucketer is not None
+        num_groups = draft_kv_num_addr_groups(self._draft_runner.token_to_kv_pool)
         with torch.no_grad():
             for tokens in compile_policy.t_bucketer.buckets:
                 for dtype in (torch.int64, torch.int32):
                     torch.zeros((tokens,), dtype=dtype).to(
                         self.device, non_blocking=True
                     ).cpu()
+                    if num_groups > 1:
+                        torch.zeros((num_groups, tokens), dtype=dtype).to(
+                            self.device, non_blocking=True
+                        ).cpu()
 
     # FIXME(junyanxu): metrics_reporter calls this on every DSPARK decode log;
     # report the block-accept estimate once the confidence budget is ported.
