@@ -107,11 +107,19 @@ def prepare_hicache_staging(
     prepare(runner.token_to_kv_pool, runner.mtp_draft_device_pools)
     if draft_plan is not None and draft_plan.mode == HiCacheDraftMode.SIDECAR:
         for pool in draft_plan.device_pools:
-            # SWA sidecars follow only the draft's SWA component.
-            prepare(
-                pool.swa_kv_pool if isinstance(pool, BaseSWAKVPool) else pool,
-                sidecar=True,
-            )
+            if isinstance(pool, BaseSWAKVPool):
+                if getattr(pool, "swa_kv_pool", None) is None:
+                    prepare(getattr(pool, "kv_pool", pool), sidecar=True)
+                else:
+                    if (
+                        getattr(pool, "full_layer_nums", 0) > 0
+                        and getattr(pool, "full_kv_pool", None) is not None
+                    ):
+                        prepare(pool.full_kv_pool, sidecar=True)
+                    if getattr(pool, "swa_layer_nums", 0) > 0:
+                        prepare(pool.swa_kv_pool, sidecar=True)
+            else:
+                prepare(pool, sidecar=True)
 
 
 def maybe_register_hicache_draft(
@@ -137,6 +145,12 @@ def maybe_register_hicache_draft(
     )
     for spec, entry in zip(specs, entries, strict=True):
         tree_cache.register_sidecar_pool(spec, entry)
+    if entries and tree_cache.cache_controller is not None:
+        counter = getattr(tree_cache.cache_controller, "layer_done_counter", None)
+        if counter is not None:
+            for draft_pool in draft_plan.device_pools:
+                if hasattr(draft_pool, "register_layer_transfer_counter"):
+                    draft_pool.register_layer_transfer_counter(counter)
 
 
 # Host slots a backup-only retraction pool gets, as a fraction of the device

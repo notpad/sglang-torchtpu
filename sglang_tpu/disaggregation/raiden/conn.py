@@ -56,6 +56,8 @@ from sglang.srt.utils.network import NetworkAddress
 from sglang_tpu.disaggregation.raiden.common import (
     CHUNK_ANNOUNCE_TOKENS,
     DEFAULT_KV_PORT,
+    DRAFT_PORT_OFFSET,
+    DRAFT_SWA_PORT_OFFSET,
     PORTS_PER_RANK,
     STATE_PORT_OFFSET,
     SWA_PORT_OFFSET,
@@ -82,6 +84,7 @@ from sglang_tpu.disaggregation.raiden.receiver import (
 )
 from sglang_tpu.disaggregation.raiden.reshard_schedule import (
     ReshardGeometry,
+    head_bytes,
     head_pair_bytes,
 )
 from sglang_tpu.disaggregation.raiden.sender import RaidenKVSender, RaidenSenderMixin
@@ -156,6 +159,10 @@ class RaidenKVManager(
     """
 
     # The legacy transport unless set_kv_caches builds a pipeline transfer.
+    _engine: Optional[Any] = None
+    _swa_engine: Optional[Any] = None
+    _kv_caches: Tuple[Any, ...] = ()
+    _swa_kv_caches: Tuple[Any, ...] = ()
     _pipeline = None
     _pipeline_enabled = False
     _listener_start_read = False
@@ -174,6 +181,22 @@ class RaidenKVManager(
     _read_state_meta: Optional[Callable[[Sequence[int]], bytes]] = None
     _write_state_meta: Optional[Callable[[Sequence[int]], bytes]] = None
     state_raiden_endpoint: Optional[str] = None
+    # Dedicated speculative draft engines when draft KV geometry/dtype/pool-type differs.
+    _draft_engine: Optional[Any] = None
+    _draft_swa_engine: Optional[Any] = None
+    _draft_kv_caches: Tuple[Any, ...] = ()
+    _draft_swa_kv_caches: Tuple[Any, ...] = ()
+    _draft_unified_swa_pool: Optional[TpuUnifiedSWAKVPool] = None
+    _draft_seq_along_lane: bool = False
+    _draft_engine_max_blocks: int = 0
+    _draft_swa_engine_max_blocks: int = 0
+    _draft_kv_head_num: Optional[int] = None
+    _draft_swa_kv_head_num: Optional[int] = None
+    _draft_total_kv_head_num: Optional[int] = None
+    _draft_swa_total_kv_head_num: Optional[int] = None
+    draft_raiden_endpoint: Optional[str] = None
+    draft_swa_raiden_endpoint: Optional[str] = None
+    _issued_paired_reads: Optional[Dict[str, Tuple[str, ...]]] = None
 
     def __init__(
         self,
@@ -285,6 +308,7 @@ class RaidenKVManager(
         # a read only while the pool has room for it and leaves the rest in
         # the transfer queue.
         self._pulling: Optional[StagingAdmission] = None
+        self._issued_paired_reads: Dict[str, Tuple[str, ...]] = {}
         # Reads of rooms the framework dropped while they were still in
         # flight. Raiden cannot cancel a read, so the read keeps its admission
         # until the engine reports it settled.
@@ -353,24 +377,33 @@ class RaidenKVManager(
 
     # ----- resharding geometry / host-slot helpers --------------------------
 
-    def _make_geometry(self, src_attn_tp: int, dst_attn_tp: int, *, swa: bool = False):
+    def _make_geometry(
+        self,
+        src_attn_tp: int,
+        dst_attn_tp: int,
+        *,
+        swa: bool = False,
+        draft: bool = False,
+        total_kv_heads_override: Optional[int] = None,
+    ):
         """ReshardGeometry for a (src_attn_tp -> dst_attn_tp) transfer, sized from
         the local fused KV tensor (the K+V head-pair granule matches on both
         sides) and the global kv-head count.
 
-        ``swa`` sizes it from the sliding-window sub-pool instead. Its layers
-        carry the same kv-head count as the full pool -- windowing bounds how
-        many tokens are kept, not how the heads are sharded -- so only the
-        head-pair granule is read from the other tensor, and the head-slice math
-        is identical. Taking it from the SWA tensor rather than assuming it
-        matches keeps the two pools free to differ in dtype or head_dim.
+        ``swa`` sizes it from the sliding-window sub-pool instead. ``draft``
+        sizes it from the dedicated speculative draft KV pool and uses the
+        draft model's global kv-head count so heterogeneous draft head counts
+        or dtypes reshard independently of the target model.
         """
-        tensors = self._swa_kv_caches if swa else self._kv_caches
+        if draft:
+            tensors = self._draft_swa_kv_caches if swa else self._draft_kv_caches
+            cache_label = "draft sliding-window" if swa else "draft full-attention"
+        else:
+            tensors = self._swa_kv_caches if swa else self._kv_caches
+            cache_label = "sliding-window" if swa else "full-attention"
         if not tensors:
             raise RuntimeError(
-                "Raiden has no "
-                + ("sliding-window" if swa else "full-attention")
-                + " KV tensors to build a reshard geometry from"
+                f"Raiden has no {cache_label} KV tensors to build a reshard geometry from"
             )
         tensor = tensors[0]
         # Resharding runs only for unequal attention TP (the pull path serves
@@ -383,9 +416,15 @@ class RaidenKVManager(
                 f"{dst_attn_tp} on decode. Run both at equal attention TP or "
                 "unset SGLANG_TPU_USE_BLOCK_MAJOR_KV on both."
             )
-        is_seq_along_lane = self._seq_along_lane or isinstance(
-            getattr(self._unified_swa_pool, "kv_pool", None), TpuSeqAlongLaneKVPool
-        )
+        if draft:
+            is_seq_along_lane = self._draft_seq_along_lane or isinstance(
+                getattr(self._draft_unified_swa_pool, "kv_pool", None),
+                TpuSeqAlongLaneKVPool,
+            )
+        else:
+            is_seq_along_lane = self._seq_along_lane or isinstance(
+                getattr(self._unified_swa_pool, "kv_pool", None), TpuSeqAlongLaneKVPool
+            )
         if (len(tensor.shape) != _FUSED_KV_RANK or is_seq_along_lane) and (
             src_attn_tp != dst_attn_tp or len(tensor.shape) < _FUSED_KV_RANK
         ):
@@ -396,11 +435,40 @@ class RaidenKVManager(
                 "Run both at equal attention TP for blocked MXINT8 or "
                 "seq-along-lane KV layouts."
             )
-        hp = head_pair_bytes(tensor)
-        # Distinct model kv-head count (model_config.get_total_num_kv_heads()),
-        # set on both the prefill and decode KVArgs.
-        total_kv_heads = int(self.kv_args.total_kv_head_num)
-        return ReshardGeometry(src_attn_tp, dst_attn_tp, hp, total_kv_heads)
+        if draft:
+            if total_kv_heads_override is not None and total_kv_heads_override > 0:
+                total_kv_heads = int(total_kv_heads_override)
+            else:
+                cfg_total = (
+                    self._draft_swa_total_kv_head_num
+                    if swa
+                    else self._draft_total_kv_head_num
+                )
+                per_rank = (
+                    self._draft_swa_kv_head_num if swa else self._draft_kv_head_num
+                )
+                if cfg_total is not None and cfg_total > 0:
+                    total_kv_heads = int(cfg_total)
+                elif per_rank is not None and per_rank > 0:
+                    total_kv_heads = int(per_rank) * int(self.attn_tp_size)
+                else:
+                    total_kv_heads = int(tensor.shape[2]) * int(self.attn_tp_size)
+        else:
+            total_kv_heads = int(self.kv_args.total_kv_head_num)
+        kv_packing = int(tensor.shape[3])
+        elem_size = int(tensor.element_size())
+        if kv_packing in (1, 2, 4) and kv_packing * elem_size == 4:
+            return ReshardGeometry(
+                src_attn_tp,
+                dst_attn_tp,
+                head_bytes(tensor),
+                total_kv_heads,
+                kv_packing=kv_packing,
+                element_size=elem_size,
+            )
+        return ReshardGeometry(
+            src_attn_tp, dst_attn_tp, head_pair_bytes(tensor), total_kv_heads
+        )
 
     # ----- engine lifecycle -------------------------------------------------
 
@@ -416,17 +484,39 @@ class RaidenKVManager(
         self._swa_kv_caches = list(kv_caches.swa)
         self._unified_swa_pool = kv_caches.unified_swa_pool
         self._seq_along_lane = kv_caches.seq_along_lane
+        self._draft_kv_caches = tuple(kv_caches.draft_full)
+        self._draft_swa_kv_caches = tuple(kv_caches.draft_swa)
+        self._draft_unified_swa_pool = kv_caches.draft_unified_swa_pool
+        self._draft_seq_along_lane = kv_caches.draft_seq_along_lane
+        self._draft_kv_head_num = kv_caches.draft_kv_head_num
+        self._draft_swa_kv_head_num = kv_caches.draft_swa_kv_head_num
+        self._draft_total_kv_head_num = kv_caches.draft_total_kv_head_num
+        self._draft_swa_total_kv_head_num = kv_caches.draft_swa_total_kv_head_num
         self.kv_layout = (
             UNIFIED_SWA_KV_LAYOUT
             if self._unified_swa_pool is not None
             else kv_layout_of(self._kv_caches)
         )
         if self._unified_swa_pool is not None:
-            page_bytes = getattr(self, "kv_item_lens_sum", 0) or sum(
-                int(buf[0].nbytes) for buf in self._kv_caches
+            target_page_bytes = sum(int(buf[0].nbytes) for buf in self._kv_caches)
+            draft_page_bytes = sum(int(buf[0].nbytes) for buf in self._draft_kv_caches)
+            draft_swa_page_bytes = sum(
+                int(buf[0].nbytes) for buf in self._draft_swa_kv_caches
             )
-            self.state_item_lens_sum = (
-                page_bytes * self._unified_swa_pool.layout.num_swa_groups
+            swa_item_bytes = (
+                target_page_bytes * self._unified_swa_pool.layout.num_swa_groups
+            )
+            if self._draft_unified_swa_pool is not None:
+                swa_item_bytes += (
+                    draft_page_bytes
+                    * self._draft_unified_swa_pool.layout.num_swa_groups
+                )
+            elif self._draft_swa_kv_caches:
+                swa_item_bytes += draft_swa_page_bytes
+            self.state_item_lens_sum = swa_item_bytes
+        elif self._draft_swa_kv_caches:
+            self.state_item_lens_sum = getattr(self, "state_item_lens_sum", 0) + sum(
+                int(buf[0].nbytes) for buf in self._draft_swa_kv_caches
             )
         self._state_kv_caches = tuple(kv_caches.state)
         self._state_type = kv_caches.state_type
@@ -451,6 +541,12 @@ class RaidenKVManager(
                 raise NotImplementedError(
                     "Raiden pipeline transfer does not support TpuUnifiedSWAKVPool "
                     "(--enable-unified-memory); disable pipeline parallelism and "
+                    f"{tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.name}."
+                )
+            if self._draft_kv_caches or self._draft_swa_kv_caches:
+                raise NotImplementedError(
+                    "Raiden pipeline transfer does not support heterogeneous "
+                    "speculative draft KV pools; disable pipeline parallelism and "
                     f"{tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.name}."
                 )
             if self._state_kv_caches:
@@ -486,7 +582,13 @@ class RaidenKVManager(
     def _build_engine(self) -> None:
         if self._engine is not None or self._kv_caches is None:
             return
-        engines = 1 + bool(self._swa_kv_caches) + bool(self._state_kv_caches)
+        engines = (
+            1
+            + bool(self._swa_kv_caches)
+            + bool(self._state_kv_caches)
+            + bool(self._draft_kv_caches)
+            + bool(self._draft_swa_kv_caches)
+        )
         max_blocks = self._max_request_blocks()
         if self._unified_swa_pool is not None:
             max_blocks += (
@@ -504,6 +606,8 @@ class RaidenKVManager(
         pool_pages = num_slots * max_blocks
         swa_pool_pages = None
         state_pool_pages = None
+        draft_pool_pages = None
+        draft_swa_pool_pages = None
         logger.info(
             "RaidenKVManager rank%d engine up | endpoint=%s kv_tensors=%d "
             "max_blocks=%d num_slots=%d pool_pages=%d chunked=%d parallelism=%d",
@@ -562,9 +666,69 @@ class RaidenKVManager(
                 state_num_slots,
                 state_pool_pages,
             )
+        if self._draft_kv_caches:
+            draft_max_blocks = self._max_request_blocks()
+            if self._draft_unified_swa_pool is not None:
+                draft_max_blocks += (
+                    self._draft_unified_swa_pool.layout.num_swa_groups
+                    * self._swa_max_request_blocks()
+                )
+            draft_num_slots = self._num_slots(
+                list(self._draft_kv_caches), draft_max_blocks, engines
+            )
+            self.draft_raiden_endpoint, self._draft_engine = self._start_engine(
+                kv_caches=list(self._draft_kv_caches),
+                port=self._control_port + DRAFT_PORT_OFFSET,
+                max_blocks=draft_max_blocks,
+                num_slots=draft_num_slots,
+            )
+            self._draft_engine_max_blocks = draft_max_blocks
+            draft_pool_pages = draft_num_slots * draft_max_blocks
+            logger.info(
+                "RaidenKVManager rank%d draft engine up | endpoint=%s "
+                "kv_tensors=%d max_blocks=%d num_slots=%d pool_pages=%d",
+                self.attn_tp_rank,
+                self.draft_raiden_endpoint,
+                len(self._draft_kv_caches),
+                draft_max_blocks,
+                draft_num_slots,
+                draft_pool_pages,
+            )
+        if self._draft_swa_kv_caches:
+            draft_swa_max_blocks = self._swa_max_request_blocks()
+            draft_swa_num_slots = self._num_slots(
+                list(self._draft_swa_kv_caches), draft_swa_max_blocks, engines
+            )
+            (
+                self.draft_swa_raiden_endpoint,
+                self._draft_swa_engine,
+            ) = self._start_engine(
+                kv_caches=list(self._draft_swa_kv_caches),
+                port=self._control_port + DRAFT_SWA_PORT_OFFSET,
+                max_blocks=draft_swa_max_blocks,
+                num_slots=draft_swa_num_slots,
+            )
+            self._draft_swa_engine_max_blocks = draft_swa_max_blocks
+            draft_swa_pool_pages = draft_swa_num_slots * draft_swa_max_blocks
+            logger.info(
+                "RaidenKVManager rank%d draft SWA engine up | endpoint=%s "
+                "kv_tensors=%d max_blocks=%d num_slots=%d pool_pages=%d",
+                self.attn_tp_rank,
+                self.draft_swa_raiden_endpoint,
+                len(self._draft_swa_kv_caches),
+                draft_swa_max_blocks,
+                draft_swa_num_slots,
+                draft_swa_pool_pages,
+            )
         # Each engine's pool is handed out read by read, so the pages the
         # decode may hold in flight are the pages raiden reserved.
-        self._pulling = StagingAdmission(pool_pages, swa_pool_pages, state_pool_pages)
+        self._pulling = StagingAdmission(
+            pool_pages,
+            swa_pool_pages,
+            state_pool_pages,
+            draft_pool_pages,
+            draft_swa_pool_pages,
+        )
 
     def _start_engine(
         self, *, kv_caches: List[Any], port: int, max_blocks: int, num_slots: int
@@ -701,28 +865,56 @@ class RaidenKVManager(
     def _state_req_id(room: int) -> str:
         return f"state:{room}"
 
+    @staticmethod
+    def _draft_req_id(room: int, chunk: Optional[int] = None) -> str:
+        return f"draft:{room}" if chunk is None else f"draft:{room}#{chunk}"
+
+    @staticmethod
+    def _draft_swa_req_id(room: int) -> str:
+        return f"draft_swa:{room}"
+
     @classmethod
     def _room_of(cls, rid: str) -> Optional[int]:
         """The room of a whole ("<room>"), sliding-window ("swa:<room>"), GDN
-        state ("state:<room>") or chunk ("<room>#<k>") transfer id, resharded
-        or not; None for any other id."""
-        room = cls._norm_req_id(rid).removeprefix("swa:").removeprefix("state:")
+        state ("state:<room>"), dedicated draft ("draft:<room>" /
+        "draft:<room>#<k>" / "draft_swa:<room>") or chunk ("<room>#<k>")
+        transfer id, resharded or not; None for any other id."""
+        room = (
+            cls._norm_req_id(rid)
+            .removeprefix("swa:")
+            .removeprefix("state:")
+            .removeprefix("draft_swa:")
+            .removeprefix("draft:")
+        )
         room = room.partition("#")[0]
         return int(room) if room.isdecimal() else None
 
     def _is_room_transfer(self, key: str, room: int) -> bool:
-        """Whether key is a whole, sliding-window, state or chunk id of room."""
-        return key in (
-            str(room),
-            self._swa_req_id(room),
-            self._state_req_id(room),
-        ) or key.startswith(f"{room}#")
+        """Whether key is a whole, sliding-window, state, draft or chunk id of room."""
+        return (
+            key
+            in (
+                str(room),
+                self._swa_req_id(room),
+                self._state_req_id(room),
+                self._draft_req_id(room),
+                self._draft_swa_req_id(room),
+            )
+            or key.startswith(f"{room}#")
+            or key.startswith(f"draft:{room}#")
+        )
 
     def _side_reads_done(self, room: int, done: Set[str]) -> bool:
-        """Whether the room's sliding-window and state reads, where their
-        engines exist, are in done."""
-        return (self._swa_engine is None or self._swa_req_id(room) in done) and (
-            self._state_engine is None or self._state_req_id(room) in done
+        """Whether the room's sliding-window, state, and dedicated draft reads,
+        where their engines exist, are in done."""
+        return (
+            (self._swa_engine is None or self._swa_req_id(room) in done)
+            and (self._state_engine is None or self._state_req_id(room) in done)
+            and (self._draft_engine is None or self._draft_req_id(room) in done)
+            and (
+                self._draft_swa_engine is None
+                or self._draft_swa_req_id(room) in done
+            )
         )
 
     @staticmethod
@@ -754,6 +946,8 @@ class RaidenKVManager(
             ("full", self._engine),
             ("swa", self._swa_engine),
             ("state", self._state_engine),
+            ("draft", self._draft_engine),
+            ("draft_swa", self._draft_swa_engine),
         )
         if all(engine is None for _, engine in engines):
             return
@@ -903,6 +1097,16 @@ class RaidenKVManager(
             rids.append(self._swa_req_id(room))
         if self._state_engine is not None:
             rids.append(self._state_req_id(room))
+        if (
+            self._draft_engine is not None
+            and self._draft_req_id(room) in self._send_done_at
+        ):
+            rids.append(self._draft_req_id(room))
+        if (
+            self._draft_swa_engine is not None
+            and self._draft_swa_req_id(room) in self._send_done_at
+        ):
+            rids.append(self._draft_swa_req_id(room))
         times = [self._send_done_at.get(rid) for rid in rids]
         return None if None in times else max(times)
 
@@ -910,12 +1114,17 @@ class RaidenKVManager(
         """Drops a receiver plan whose push has settled.
 
         Raiden drops a timed-out plan itself, so one it no longer knows has
-        already been dropped -- which is also why this can sweep both engines
-        unconditionally: a hybrid room registers the same uuid on each, and on
-        an engine that never held it the drop is the same no-op as for a plan
-        raiden already reaped.
+        already been dropped -- which is also why this can sweep all engines
+        unconditionally: a hybrid/draft room registers the same uuid on each,
+        and on an engine that never held it the drop is the same no-op as for
+        a plan raiden already reaped.
         """
-        for engine in (self._engine, self._swa_engine):
+        for engine in (
+            self._engine,
+            self._swa_engine,
+            self._draft_engine,
+            self._draft_swa_engine,
+        ):
             if engine is None:
                 continue
             try:
@@ -1183,6 +1392,30 @@ class RaidenKVManager(
             return self._unified_swa_pool.expand_swa_pages(pages)
         return pages
 
+    def _draft_swa_blocks_from_state_indices(
+        self, state_indices: Optional[List]
+    ) -> List[int]:
+        if not self._draft_swa_kv_caches and self._draft_unified_swa_pool is None:
+            return []
+        try:
+            index = self.kv_args.state_types.index(StateType.SWA)
+        except ValueError as exc:
+            raise RuntimeError(
+                "Raiden has draft SWA KV tensors but StateType.SWA is not registered"
+            ) from exc
+        if (
+            state_indices is None
+            or index >= len(state_indices)
+            or state_indices[index] is None
+        ):
+            raise RuntimeError("Raiden draft SWA transfer is missing its page indices")
+        pages = [int(x) for x in state_indices[index]]
+        if self._draft_unified_swa_pool is not None:
+            return self._draft_unified_swa_pool.expand_swa_pages(pages)
+        if self._unified_swa_pool is not None:
+            return self._unified_swa_pool.translate_swa_pages_for_draft(pages)
+        return pages
+
     def _state_rows_from_state_indices(
         self, state_indices: Optional[List]
     ) -> List[int]:
@@ -1328,6 +1561,11 @@ class RaidenKVManager(
                 del self._send_done_at[key]
             for ids in (self._completed_recv, self._failed, self._native_failed):
                 ids.difference_update([k for k in ids if belongs(k) and k not in held])
+            if self._issued_paired_reads is not None:
+                for key in [
+                    k for k in self._issued_paired_reads if belongs(k) and k not in held
+                ]:
+                    del self._issued_paired_reads[key]
             announced = self._decode.announced_at if self._decode is not None else None
             if announced is not None:
                 for key in [k for k in announced if belongs(k)]:
@@ -1338,6 +1576,7 @@ class RaidenKVManager(
                     self._prefill.send_total,
                     self._prefill.decode_pages,
                     self._prefill.decode_swa_pages,
+                    self._prefill.decode_draft_swa_pages,
                     self._prefill.chunk_seq,
                     self._prefill.reshard_chunks,
                     self._prefill.pending_offer,
@@ -1346,6 +1585,7 @@ class RaidenKVManager(
                     self._prefill.send_blocks,
                     self._prefill.send_block_set,
                     self._prefill.send_swa_blocks,
+                    self._prefill.send_draft_swa_blocks,
                     self._prefill.send_state_rows,
                     self._prefill.send_state_meta,
                     self._prefill.send_aux,
@@ -1374,17 +1614,22 @@ class RaidenKVManager(
                     self._decode.reshard_chunk_sources,
                     self._decode.local_blocks,
                     self._decode.local_swa_blocks,
+                    self._decode.local_draft_swa_blocks,
                     self._decode.local_state_rows,
                     self._decode.decode_aux_index,
                     self._decode.remote_blocks,
                     self._decode.remote_swa_blocks,
+                    self._decode.remote_draft_swa_blocks,
                     self._decode.remote_state_rows,
                     self._decode.remote_endpoint,
                     self._decode.remote_swa_endpoint,
+                    self._decode.remote_draft_endpoint,
+                    self._decode.remote_draft_swa_endpoint,
                     self._decode.remote_state_endpoint,
                     self._decode.reshard_meta,
                     self._decode.reshard_sources,
                     self._decode.reshard_swa_sources,
+                    self._decode.reshard_draft_swa_sources,
                 ):
                     table.pop(room, None)
                 for table in (

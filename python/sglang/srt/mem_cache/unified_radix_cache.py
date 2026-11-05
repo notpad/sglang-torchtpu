@@ -47,7 +47,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.swa_memory_pool import BaseSWAKVPool, SWAKVPool
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
     CacheAction,
@@ -1375,7 +1375,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return False
 
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
-        if isinstance(kv_cache, SWAKVPool):
+        if isinstance(kv_cache, BaseSWAKVPool):
             return (
                 self.supports_swa()
                 and {

@@ -20,6 +20,7 @@ class PrefillState:
     # The pages of send_blocks, for the repeated-page check.
     send_block_set: Dict[int, Set[int]] = field(default_factory=dict)
     send_swa_blocks: Dict[int, List[int]] = field(default_factory=dict)
+    send_draft_swa_blocks: Dict[int, List[int]] = field(default_factory=dict)
     # Committed state row/pages of the room, on the state engine.
     send_state_rows: Dict[int, List[int]] = field(default_factory=dict)
     send_state_meta: Dict[int, bytes] = field(default_factory=dict)
@@ -34,6 +35,7 @@ class PrefillState:
     send_total: Dict[int, int] = field(default_factory=dict)
     decode_pages: Dict[int, int] = field(default_factory=dict)
     decode_swa_pages: Dict[int, int] = field(default_factory=dict)
+    decode_draft_swa_pages: Dict[int, int] = field(default_factory=dict)
 
     # Announced reshard chunks retained until the decode requests their push.
     reshard_chunks: Dict[int, Dict[int, Tuple[int, List[int]]]] = field(
@@ -77,13 +79,17 @@ class DecodeState:
     # Local and remote page ids, endpoints, and aux slots, keyed by room.
     local_blocks: Dict[int, List[int]] = field(default_factory=dict)
     local_swa_blocks: Dict[int, List[int]] = field(default_factory=dict)
+    local_draft_swa_blocks: Dict[int, List[int]] = field(default_factory=dict)
     local_state_rows: Dict[int, List[int]] = field(default_factory=dict)
     decode_aux_index: Dict[int, int] = field(default_factory=dict)
     remote_blocks: Dict[int, List[int]] = field(default_factory=dict)
     remote_swa_blocks: Dict[int, List[int]] = field(default_factory=dict)
+    remote_draft_swa_blocks: Dict[int, List[int]] = field(default_factory=dict)
     remote_state_rows: Dict[int, List[int]] = field(default_factory=dict)
     remote_endpoint: Dict[int, str] = field(default_factory=dict)
     remote_swa_endpoint: Dict[int, str] = field(default_factory=dict)
+    remote_draft_endpoint: Dict[int, str] = field(default_factory=dict)
+    remote_draft_swa_endpoint: Dict[int, str] = field(default_factory=dict)
     remote_state_endpoint: Dict[int, str] = field(default_factory=dict)
 
     # Announcement time by read id; expired reads must never be issued.
@@ -115,5 +121,8 @@ class DecodeState:
     # Per-room block ids from each source rank, for full and SWA KV.
     reshard_sources: Dict[int, Dict[int, List[int]]] = field(default_factory=dict)
     reshard_swa_sources: Dict[int, Dict[int, List[int]]] = field(default_factory=dict)
+    reshard_draft_swa_sources: Dict[int, Dict[int, List[int]]] = field(
+        default_factory=dict
+    )
     reshard_meta: Dict[int, dict] = field(default_factory=dict)
     reshard_registered: Set[int] = field(default_factory=set)

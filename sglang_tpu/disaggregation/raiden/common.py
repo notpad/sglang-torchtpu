@@ -46,12 +46,14 @@ logger = logging.getLogger("sglang_tpu.disaggregation.raiden.conn")
 # pieces of this size keep the overlap while costing a few reads per request.
 CHUNK_ANNOUNCE_TOKENS = 8192
 
-# Ports each rank reserves: control+data for the full, SWA and GDN state engines.
-PORTS_PER_RANK = 6
+# Ports each rank reserves: control+data for full, SWA, state, draft, and draft-SWA engines.
+PORTS_PER_RANK = 10
 SWA_PORT_OFFSET = 2
 STATE_PORT_OFFSET = 4
+DRAFT_PORT_OFFSET = 6
+DRAFT_SWA_PORT_OFFSET = 8
 
-# Base of the per-rank control ports (`base + 6*local_rank`). Not 30000: that
+# Base of the per-rank control ports (`base + 10*local_rank`). Not 30000: that
 # puts rank 0 on the default HTTP serving port, and the engine wins the bind --
 # uvicorn then dies with EADDRINUSE and takes the server down before any
 # transfer is attempted.
@@ -97,6 +99,70 @@ class RaidenKVCacheGroups:
     unified_swa_pool: Optional[TpuUnifiedSWAKVPool] = None
     # True when any KV pool uses the 5D token-minor SEQ_ALONG_LANE layout.
     seq_along_lane: bool = False
+    # Dedicated draft-engine cache groups when draft geometry/dtype/pool-type differs.
+    draft_full: List[Any] = field(default_factory=list)
+    draft_swa: List[Any] = field(default_factory=list)
+    draft_full_layer_ids: List[int] = field(default_factory=list)
+    draft_swa_layer_ids: List[int] = field(default_factory=list)
+    draft_unified_swa_pool: Optional[TpuUnifiedSWAKVPool] = None
+    draft_seq_along_lane: bool = False
+    draft_kv_head_num: Optional[int] = None
+    draft_swa_kv_head_num: Optional[int] = None
+    draft_total_kv_head_num: Optional[int] = None
+    draft_swa_total_kv_head_num: Optional[int] = None
+
+
+def get_draft_total_kv_head_nums(
+    scheduler: Any,
+) -> tuple[Optional[int], Optional[int]]:
+    """Return ``(draft_total_kv_head_num, draft_swa_total_kv_head_num)`` if available."""
+    draft_worker = getattr(scheduler, "draft_worker", None)
+    get_runners = getattr(draft_worker, "_draft_model_runners", None)
+    runners = get_runners() if callable(get_runners) else ()
+    if not runners:
+        return None, None
+    mc = getattr(runners[0], "model_config", None)
+    if mc is None:
+        return None, None
+    full_total = int(mc.get_total_num_kv_heads())
+    hf_tc = getattr(mc, "hf_text_config", None)
+    if getattr(hf_tc, "swa_num_key_value_heads", None) is not None:
+        swa_total = int(hf_tc.swa_num_key_value_heads)
+    elif getattr(hf_tc, "attention_other_setting", None) is not None:
+        swa_total = int(
+            hf_tc.attention_other_setting.get("num_attention_groups", full_total)
+        )
+    else:
+        swa_total = full_total
+    return full_total, swa_total
+
+
+def _pool_head_nums(
+    pool: Optional[KVCache],
+) -> tuple[Optional[int], Optional[int]]:
+    if pool is None:
+        return None, None
+    if isinstance(pool, TpuUnifiedSWAKVPool):
+        return int(pool.full.head_num), int(pool.swa.head_num)
+    if isinstance(pool, SWAKVPool):
+        full_h = (
+            int(pool.full_kv_pool.head_num)
+            if pool.full_layer_nums > 0 and hasattr(pool.full_kv_pool, "head_num")
+            else None
+        )
+        swa_h = (
+            int(pool.swa_kv_pool.head_num)
+            if pool.swa_layer_nums > 0 and hasattr(pool.swa_kv_pool, "head_num")
+            else None
+        )
+        return full_h if full_h is not None else swa_h, (
+            swa_h if swa_h is not None else full_h
+        )
+    if isinstance(pool, HybridLinearKVPool):
+        h = getattr(pool.full_kv_pool, "head_num", None)
+        return (int(h), int(h)) if h is not None else (None, None)
+    h = getattr(pool, "head_num", None)
+    return (int(h), int(h)) if h is not None else (None, None)
 
 
 def _is_seq_along_lane_pool(pool: Optional[KVCache]) -> bool:
@@ -161,7 +227,12 @@ def _block_major_groups(pool: KVCache) -> Optional[RaidenKVCacheGroups]:
 
 
 def get_raiden_kv_caches(
-    pool: KVCache, draft_pool: Optional[KVCache] = None
+    pool: KVCache,
+    draft_pool: Optional[KVCache] = None,
+    *,
+    draft_total_kv_head_num: Optional[int] = None,
+    draft_swa_total_kv_head_num: Optional[int] = None,
+    target_total_kv_head_num: Optional[int] = None,
 ) -> RaidenKVCacheGroups:
     """Group per-layer device KV tensors by their page-index namespace.
 
@@ -250,9 +321,13 @@ def get_raiden_kv_caches(
             swa = []
             full_ids = []
             swa_ids = []
+            use_full_indices_for_swa = (
+                getattr(current_pool, "_swa_uses_full_indices", None) is True
+            )
             for layer_id, buf in zip(layer_ids, buffers, strict=True):
-                (swa if layers_mapping[layer_id][1] else full).append(buf)
-                (swa_ids if layers_mapping[layer_id][1] else full_ids).append(layer_id)
+                is_swa = layers_mapping[layer_id][1] and not use_full_indices_for_swa
+                (swa if is_swa else full).append(buf)
+                (swa_ids if is_swa else full_ids).append(layer_id)
             return RaidenKVCacheGroups(
                 full=full, swa=swa, full_layer_ids=full_ids, swa_layer_ids=swa_ids
             )
@@ -273,14 +348,71 @@ def get_raiden_kv_caches(
     full_ids, swa_ids = list(groups.full_layer_ids), list(groups.swa_layer_ids)
     seq_along_lane = _is_seq_along_lane_pool(pool)
     num_draft_full = num_draft_swa = num_hidden_full = 0
+    draft_full: List[Any] = []
+    draft_swa: List[Any] = []
+    draft_full_ids: List[int] = []
+    draft_swa_ids: List[int] = []
+    draft_unified_swa_pool: Optional[TpuUnifiedSWAKVPool] = None
+    draft_seq_along_lane = False
+    draft_kv_head_num: Optional[int] = None
+    draft_swa_kv_head_num: Optional[int] = None
     if draft_pool is not None and draft_pool is not pool:
         draft_groups = group_one(draft_pool)
-        num_draft_full, num_draft_swa = len(draft_groups.full), len(draft_groups.swa)
-        full.extend(draft_groups.full)
-        swa.extend(draft_groups.swa)
-        full_ids.extend(draft_groups.full_layer_ids)
-        swa_ids.extend(draft_groups.swa_layer_ids)
-        seq_along_lane = seq_along_lane or _is_seq_along_lane_pool(draft_pool)
+        target_full_h, target_swa_h = _pool_head_nums(pool)
+        draft_kv_head_num, draft_swa_kv_head_num = _pool_head_nums(draft_pool)
+        needs_dedicated_draft = (
+            isinstance(pool, TpuUnifiedSWAKVPool)
+            or isinstance(draft_pool, TpuUnifiedSWAKVPool)
+            or (getattr(draft_pool, "_swa_uses_full_indices", None) is True)
+            or (
+                bool(draft_groups.full)
+                and (
+                    not full
+                    or tuple(draft_groups.full[0].shape) != tuple(full[0].shape)
+                    or draft_groups.full[0].dtype != full[0].dtype
+                )
+            )
+            or (
+                bool(draft_groups.swa)
+                and (
+                    not swa
+                    or tuple(draft_groups.swa[0].shape) != tuple(swa[0].shape)
+                    or draft_groups.swa[0].dtype != swa[0].dtype
+                )
+            )
+            or (
+                draft_kv_head_num is not None
+                and target_full_h is not None
+                and draft_kv_head_num != target_full_h
+            )
+            or (
+                draft_swa_kv_head_num is not None
+                and target_swa_h is not None
+                and draft_swa_kv_head_num != target_swa_h
+            )
+            or (
+                draft_total_kv_head_num is not None
+                and target_total_kv_head_num is not None
+                and draft_total_kv_head_num != target_total_kv_head_num
+            )
+        )
+        if needs_dedicated_draft:
+            draft_full = list(draft_groups.full)
+            draft_swa = list(draft_groups.swa)
+            draft_full_ids = list(draft_groups.full_layer_ids)
+            draft_swa_ids = list(draft_groups.swa_layer_ids)
+            draft_unified_swa_pool = draft_groups.unified_swa_pool
+            draft_seq_along_lane = _is_seq_along_lane_pool(draft_pool)
+        else:
+            num_draft_full, num_draft_swa = (
+                len(draft_groups.full),
+                len(draft_groups.swa),
+            )
+            full.extend(draft_groups.full)
+            swa.extend(draft_groups.swa)
+            full_ids.extend(draft_groups.full_layer_ids)
+            swa_ids.extend(draft_groups.swa_layer_ids)
+            seq_along_lane = seq_along_lane or _is_seq_along_lane_pool(draft_pool)
 
     if hidden_pool is not None:
         full.append(hidden_pool.buffer)
@@ -310,7 +442,13 @@ def get_raiden_kv_caches(
         state = pool.mamba_pool.get_state()
         committed_state_row = pool.mamba_pool.committed_row
 
-    for name, group in (("full KV", full), ("SWA KV", swa), ("GDN state", state)):
+    for name, group in (
+        ("full KV", full),
+        ("SWA KV", swa),
+        ("GDN state", state),
+        ("draft full KV", draft_full),
+        ("draft SWA KV", draft_swa),
+    ):
         block_counts = {int(buf.shape[0]) for buf in group}
         if len(block_counts) > 1:
             raise RuntimeError(
@@ -333,4 +471,18 @@ def get_raiden_kv_caches(
         write_state_meta=write_state_meta,
         unified_swa_pool=groups.unified_swa_pool,
         seq_along_lane=seq_along_lane,
+        draft_full=draft_full,
+        draft_swa=draft_swa,
+        draft_full_layer_ids=draft_full_ids,
+        draft_swa_layer_ids=draft_swa_ids,
+        draft_unified_swa_pool=draft_unified_swa_pool,
+        draft_seq_along_lane=draft_seq_along_lane,
+        draft_kv_head_num=draft_kv_head_num,
+        draft_swa_kv_head_num=draft_swa_kv_head_num,
+        draft_total_kv_head_num=draft_total_kv_head_num,
+        draft_swa_total_kv_head_num=(
+            draft_swa_total_kv_head_num
+            if draft_swa_total_kv_head_num is not None
+            else draft_total_kv_head_num
+        ),
     )

@@ -63,8 +63,41 @@ def _pool_bytes(pool) -> int:
 
 def _draft_bytes(target, draft) -> int:
     if isinstance(draft, BaseSWAKVPool):
-        # Match sidecar construction: only SWA drafts follow target SWA slots.
-        target, draft = target.swa_kv_pool, draft.swa_kv_pool
+        draft_swa = getattr(draft, "swa_kv_pool", None)
+        if draft_swa is None:
+            # Unified Full+SWA draft pool: its physical slab is already co-sized
+            # relative to the target unified pool.
+            return _pool_bytes(draft)
+        draft_full = getattr(draft, "full_kv_pool", None)
+        has_full = (
+            draft_full is not None
+            and getattr(draft, "full_layer_nums", 1) > 0
+            and draft_full.size > 0
+        )
+        has_swa = (
+            getattr(draft, "swa_layer_nums", 1) > 0
+            and draft_swa.size > 0
+        )
+        swa_uses_full = getattr(draft, "_swa_uses_full_indices", None) is True
+        target_full_pool = getattr(target, "full_kv_pool", None)
+        target_full_size = (
+            target_full_pool.size if target_full_pool is not None else target.size
+        )
+        target_swa_pool = getattr(target, "swa_kv_pool", None)
+        if swa_uses_full:
+            target_swa_size = target_full_size
+        elif target_swa_pool is not None:
+            target_swa_size = target_swa_pool.size
+        else:
+            target_swa_size = (
+                target.num_pages // target.layout.num_swa_groups
+            ) * target.page_size
+        total = 0
+        if has_full:
+            total += _pool_bytes(draft_full) * target_full_size // draft_full.size
+        if has_swa:
+            total += _pool_bytes(draft_swa) * target_swa_size // draft_swa.size
+        return total
     # A sidecar has one host slot per target slot, however few slots the draft has.
     return _pool_bytes(draft) * target.size // draft.size
 

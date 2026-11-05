@@ -215,6 +215,87 @@ class TestHiCacheAutoSize(CustomTestCase):
             self.assertEqual(sizing._SIZEABLE_POOLS.count(_CustomDevicePool), 1)
             self.assertEqual(sizing._estimate_hicache_bytes(params, None), 8192)
 
+    def test_unified_target_with_heterogeneous_spec_draft_sidecars(self):
+        class _UnifiedTarget:
+            size = 128
+            num_pages = 32
+            page_size = 4
+            swa_kv_pool = None
+            full_kv_pool = None
+            layout = Mock(num_swa_groups=2)
+            host_capacity_bytes = 8192
+
+        target = _UnifiedTarget()
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=Mock(get_kvcache=Mock(return_value=target)),
+            page_size=4,
+        )
+        draft_2a = Mock(
+            spec=MHATokenToKVPool,
+            size=64,
+            host_capacity_bytes=None,
+            get_kv_size_bytes=Mock(return_value=512),
+        )
+        draft_2b = Mock(
+            spec=BaseSWAKVPool,
+            swa_kv_pool=None,
+            host_capacity_bytes=1536,
+        )
+        draft_full_sub = Mock(
+            spec=MHATokenToKVPool,
+            size=128,
+            host_capacity_bytes=None,
+            get_kv_size_bytes=Mock(return_value=1024),
+        )
+        draft_swa_sub = Mock(
+            spec=MHATokenToKVPool,
+            size=32,
+            host_capacity_bytes=None,
+            get_kv_size_bytes=Mock(return_value=256),
+        )
+        draft_2c_swa = Mock(
+            spec=SWAKVPool,
+            full_layer_nums=0,
+            swa_layer_nums=2,
+            full_kv_pool=draft_full_sub,
+            swa_kv_pool=draft_swa_sub,
+        )
+        draft_2c_mixed = Mock(
+            spec=SWAKVPool,
+            full_layer_nums=1,
+            swa_layer_nums=2,
+            full_kv_pool=draft_full_sub,
+            swa_kv_pool=draft_swa_sub,
+        )
+        draft_mtp = Mock(
+            spec=SWAKVPool,
+            full_layer_nums=0,
+            swa_layer_nums=1,
+            full_kv_pool=draft_full_sub,
+            swa_kv_pool=draft_swa_sub,
+        )
+        draft_mtp._swa_uses_full_indices = True
+
+        # target_swa_tokens = (32 // 2) * 4 = 64
+        with patch.object(
+            sizing, "_SIZEABLE_POOLS", (*sizing._SIZEABLE_POOLS, _UnifiedTarget)
+        ):
+            for label, draft, expected_draft in (
+                ("case_2a", draft_2a, 512 * 128 // 64),  # 1024
+                ("case_2b", draft_2b, 1536),
+                ("case_2c_swa", draft_2c_swa, 256 * 64 // 32),  # 512
+                ("case_2c_mixed", draft_2c_mixed, 1024 + 256 * 64 // 32),  # 1536
+                ("case_2a_mtp", draft_mtp, 256 * 128 // 32),  # 1024
+            ):
+                with self.subTest(case=label):
+                    plan = Mock(mode="sidecar", device_pools=(draft,))
+                    self.assertEqual(
+                        sizing._estimate_hicache_bytes(params, plan),
+                        8192 + expected_draft,
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()

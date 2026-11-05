@@ -663,6 +663,193 @@ class TestFullOnlyStrategy(CustomTestCase):
                 )
                 self.assertIsNone(cache.components[ComponentType.SWA]._swa_kv_pool_host)
 
+    def test_unified_target_with_draft_sidecars_attaches_full_only_draft_pools(self):
+        from sglang.srt.speculative.base_spec_worker import HiCacheDraftPlan
+        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+
+        ps = 4
+        draft_2a = TpuFusedMHATokenToKVPool(
+            size=64,
+            page_size=ps,
+            dtype=torch.bfloat16,
+            head_num=1,
+            head_dim=64,
+            layer_num=2,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        draft_2b = TpuUnifiedSWAKVPool(
+            size=64,
+            page_size=ps,
+            dtype=torch.bfloat16,
+            full=AttnLayerSpec(head_num=1, head_dim=64, layer_ids=[0, 2]),
+            swa=AttnLayerSpec(head_num=1, head_dim=64, layer_ids=[1, 3]),
+            device="cpu",
+        )
+        draft_2c_swa = SWAKVPool(
+            size=64,
+            size_swa=32,
+            page_size=ps,
+            dtype=torch.bfloat16,
+            head_num=1,
+            head_dim=64,
+            swa_attention_layer_ids=[0, 1],
+            full_attention_layer_ids=[],
+            device="cpu",
+            token_to_kv_pool_class=TpuFusedMHATokenToKVPool,
+        )
+        draft_2c_mixed = SWAKVPool(
+            size=64,
+            size_swa=32,
+            page_size=ps,
+            dtype=torch.bfloat16,
+            head_num=2,
+            head_dim=64,
+            swa_attention_layer_ids=[1, 2],
+            full_attention_layer_ids=[0],
+            device="cpu",
+            token_to_kv_pool_class=TpuFusedMHATokenToKVPool,
+            swa_kv_pool_kwargs=dict(
+                page_size=ps,
+                enable_memory_saver=False,
+                device="cpu",
+                head_num=1,
+                head_dim=64,
+            ),
+        )
+        draft_mtp = SWAKVPool(
+            size=64,
+            size_swa=64,
+            page_size=ps,
+            dtype=torch.bfloat16,
+            head_num=1,
+            head_dim=64,
+            swa_attention_layer_ids=[0],
+            full_attention_layer_ids=[],
+            device="cpu",
+            token_to_kv_pool_class=TpuFusedMHATokenToKVPool,
+        )
+        draft_mtp._swa_uses_full_indices = True
+
+        for label, draft, exp_pools, exp_dev in (
+            ("2a", draft_2a, {PoolName.KV, PoolName.DRAFT}, draft_2a),
+            ("2b", draft_2b, {PoolName.KV, PoolName.DRAFT}, draft_2b.kv_pool),
+            ("2c_swa", draft_2c_swa, {PoolName.KV}, None),
+            (
+                "2c_mixed",
+                draft_2c_mixed,
+                {PoolName.KV, PoolName.DRAFT},
+                draft_2c_mixed.full_kv_pool,
+            ),
+            ("2a_mtp", draft_mtp, {PoolName.KV, PoolName.DRAFT}, draft_mtp.swa_kv_pool),
+        ):
+            with self.subTest(case=label), installed_patches():
+                pool = TpuUnifiedSWAKVPool(
+                    size=64,
+                    page_size=ps,
+                    dtype=torch.bfloat16,
+                    full=AttnLayerSpec(head_num=2, head_dim=128, layer_ids=[1, 3]),
+                    swa=AttnLayerSpec(head_num=2, head_dim=128, layer_ids=[0, 2, 4]),
+                    device="cpu",
+                )
+                req_pool = ReqToTokenPool(
+                    size=4, max_context_len=64, device="cpu", enable_memory_saver=False
+                )
+                alloc = TpuUnifiedSWATokenToKVPoolAllocator(
+                    size=64,
+                    page_size=ps,
+                    dtype=torch.bfloat16,
+                    device="cpu",
+                    kvcache=pool,
+                    need_sort=False,
+                    req_to_token_pool=req_pool,
+                )
+                params = CacheInitParams(
+                    disable=False,
+                    req_to_token_pool=req_pool,
+                    token_to_kv_pool_allocator=alloc,
+                    page_size=ps,
+                    sliding_window_size=8,
+                    tree_components=(ComponentType.FULL, ComponentType.SWA),
+                )
+                with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("python"):
+                    cache = UnifiedRadixCache(params)
+                fake_kv_host = SimpleNamespace(
+                    layout="fused_tpu_dma",
+                    device="cpu",
+                    page_num=32,
+                    page_size=ps,
+                    size=32 * ps,
+                    logical_size=32 * ps,
+                    size_per_token=1024,
+                    can_use_write_back_jit=False,
+                )
+                fake_draft_host = SimpleNamespace(
+                    layout="fused_tpu_dma",
+                    device="cpu",
+                    page_num=32,
+                    page_size=ps,
+                    size=32 * ps,
+                    logical_size=32 * ps,
+                    size_per_token=256,
+                    layer_num=2,
+                    can_use_write_back_jit=False,
+                )
+                plan = HiCacheDraftPlan(
+                    mode=HiCacheDraftMode.SIDECAR, device_pools=(draft,)
+                )
+                with (
+                    patch(TPU + ".get_memory", return_value=memory()),
+                    patch(
+                        ASSEMBLER + ".get_memory",
+                        return_value=SimpleNamespace(
+                            hicache_mem_layout="page_first_fused"
+                        ),
+                    ),
+                    patch(
+                        ASSEMBLER + ".build_kv_host_pool", return_value=fake_kv_host
+                    ),
+                    patch(
+                        ASSEMBLER + "._build_mha_mla_host_pool",
+                        return_value=fake_draft_host,
+                    ) as draft_hp_mock,
+                    patch(
+                        TPU + ".HybridCacheController.create_for_backend"
+                    ) as ctrl_cls,
+                    tpu._full_only_host_cache_build(plan),
+                ):
+                    ctrl_cls.side_effect = (
+                        lambda alloc_, hpg, ps_, _evt, **kw: MagicMock(
+                            mem_pool_host=hpg,
+                            mem_pool_device=alloc_.get_kvcache(),
+                            page_size=ps_,
+                            layer_done_counter=MagicMock(),
+                            transfer_layer_id_max=kw["transfer_layer_id_max"],
+                            register_host_pool_entry=hpg.add_entry,
+                        )
+                    )
+                    hybrid_pool_assembler.attach_hybrid_pool_to_unified_cache(
+                        cache,
+                        params,
+                        ServerArgs(model_path="dummy"),
+                        load_cache_event=None,
+                    )
+                    kv_cache_builder.maybe_register_hicache_draft(
+                        tree_cache=cache, draft_plan=plan
+                    )
+                self.assertEqual(set(cache.host_pool_group.entry_map), exp_pools)
+                if exp_dev is not None:
+                    self.assertIsNotNone(draft.layer_transfer_counter)
+                    self.assertIs(
+                        cache.host_pool_group.entry_map[PoolName.DRAFT].device_pool,
+                        exp_dev,
+                    )
+                    self.assertEqual(
+                        draft_hp_mock.call_args.kwargs["override_page_num"], 32
+                    )
+                else:
+                    self.assertIsNone(draft.layer_transfer_counter)
+
 
 class TestAdmissionAndAllocation(CustomTestCase):
     def queue(self, cache):

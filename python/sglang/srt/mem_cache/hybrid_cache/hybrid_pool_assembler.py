@@ -1433,6 +1433,9 @@ def _build_mha_mla_host_pool(
     layout: str,
     allocator_type: str,
     pool_label: str,
+    override_page_num: Optional[int] = None,
+    device_page_translator: Optional[Any] = None,
+    host_page_translator: Optional[Any] = None,
 ):
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
@@ -1450,6 +1453,12 @@ def _build_mha_mla_host_pool(
         allocator_type=allocator_type,
         pool_label=pool_label,
     )
+    if override_page_num is not None:
+        kwargs["override_page_num"] = override_page_num
+    if device_page_translator is not None:
+        kwargs["device_page_translator"] = device_page_translator
+    if host_page_translator is not None:
+        kwargs["host_page_translator"] = host_page_translator
     if isinstance(pool, MHATokenToKVPool):
         # The MHA host-pool class is a platform decision (TPU substitutes its
         # fused/raiden host pools); the platform default delegates to
@@ -1462,6 +1471,12 @@ def _build_mha_mla_host_pool(
         override_kv_cache_dim=pool.kv_cache_dim,
         **kwargs,
     )
+
+
+def _tpu_dma_override_pages(host_pool: Any) -> Optional[int]:
+    if getattr(host_pool, "layout", None) == "fused_tpu_dma":
+        return int(host_pool.page_num)
+    return None
 
 
 def build_full_draft_pools(
@@ -1482,6 +1497,7 @@ def build_full_draft_pools(
 
     controller = tree_cache.cache_controller
     host_pool_group = controller.mem_pool_host
+    target_kv_host = host_pool_group.entry_map[PoolName.KV].host_pool
 
     # Note(kpham-sgl): DCP x DSpark draft KV is replicated and spans the virtual
     # loc space, so match the target host's logical_size instead of physical size.
@@ -1492,6 +1508,7 @@ def build_full_draft_pools(
         layout=get_memory().hicache_mem_layout,
         allocator_type=_get_allocator_type(),
         pool_label="draft",
+        override_page_num=_tpu_dma_override_pages(target_kv_host),
     )
     draft_layer_mapping = {i: i for i in range(pool.layer_num)}
 
@@ -1560,19 +1577,147 @@ def build_swa_draft_pools(
     draft_kv_pool: Any,
     tree_cache: Any,
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
-    """Build a draft SWA sidecar whose indices follow target SWA."""
-    draft_swa_pool = draft_kv_pool.swa_kv_pool
-    if draft_swa_pool is None:
-        raise NotImplementedError(
-            "HiCache draft SWA sidecar requires a non-unified draft SWA pool."
-        )
-    if draft_swa_pool.layer_num == 0:
-        return [], []
+    """Build full and/or SWA draft sidecars for a ``BaseSWAKVPool`` draft."""
     controller = tree_cache.cache_controller
     host_pool_group = controller.mem_pool_host
-    target_swa_host_pool = host_pool_group.entry_map[PoolName.SWA].host_pool
+    target_kv_host = host_pool_group.entry_map[PoolName.KV].host_pool
+    has_target_swa_host = PoolName.SWA in host_pool_group.entry_map
+    target_swa_host_pool = (
+        host_pool_group.entry_map[PoolName.SWA].host_pool
+        if has_target_swa_host
+        else None
+    )
 
-    if isinstance(target_swa_host_pool, DeepSeekV4PagedHostPool):
+    draft_swa_pool = getattr(draft_kv_pool, "swa_kv_pool", None)
+    if draft_swa_pool is None:
+        # Unified Full+SWA draft pool (Case 2b).
+        full_layer_mapping, swa_layer_mapping = _swa_layer_mappings(draft_kv_pool)
+        transfer_layer_id_max = (
+            max(full_layer_mapping.keys() | swa_layer_mapping.keys()) + 1
+        )
+        if not has_target_swa_host:
+            if not full_layer_mapping:
+                return [], []
+            draft_full_host = _build_mha_mla_host_pool(
+                pool=draft_kv_pool.kv_pool,
+                host_to_device_ratio=host_pool_group.logical_size
+                / draft_kv_pool.kv_pool.size,
+                page_size=controller.page_size,
+                layout=get_memory().hicache_mem_layout,
+                allocator_type=_get_allocator_type(),
+                pool_label="draft",
+                override_page_num=_tpu_dma_override_pages(target_kv_host),
+            )
+            return (
+                [SidecarPoolSpec(pool_name=PoolName.DRAFT, indices_from_pool=PoolName.KV)],
+                [
+                    build_pool_entry(
+                        name=PoolName.DRAFT,
+                        host_pool=draft_full_host,
+                        device_pool=draft_kv_pool.kv_pool,
+                        layer_mapping=full_layer_mapping,
+                        transfer_layer_id_max=transfer_layer_id_max,
+                    )
+                ],
+            )
+        if not hasattr(target_swa_host_pool, "build_sidecar_pair_for_target"):
+            raise NotImplementedError(
+                "Unified draft SWA HiCache sidecar requires a unified TPU DMA target host pool."
+            )
+        draft_kv_host, draft_swa_host = (
+            target_swa_host_pool.build_sidecar_pair_for_target(
+                draft_kv_pool, target_swa_host_pool
+            )
+        )
+        specs: list[SidecarPoolSpec] = []
+        entries: list[PoolEntry] = []
+        if full_layer_mapping:
+            specs.append(
+                SidecarPoolSpec(pool_name=PoolName.DRAFT, indices_from_pool=PoolName.KV)
+            )
+            entries.append(
+                build_pool_entry(
+                    name=PoolName.DRAFT,
+                    host_pool=draft_kv_host,
+                    device_pool=draft_kv_pool,
+                    layer_mapping=full_layer_mapping,
+                    transfer_layer_id_max=transfer_layer_id_max,
+                )
+            )
+        if swa_layer_mapping:
+            specs.append(
+                SidecarPoolSpec(
+                    pool_name=PoolName.DRAFT_SWA,
+                    indices_from_pool=PoolName.SWA,
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            )
+            entries.append(
+                build_pool_entry(
+                    name=PoolName.DRAFT_SWA,
+                    host_pool=draft_swa_host,
+                    device_pool=draft_kv_pool,
+                    layer_mapping=swa_layer_mapping,
+                    transfer_layer_id_max=transfer_layer_id_max,
+                )
+            )
+        return specs, entries
+
+    specs = []
+    entries = []
+    draft_full_pool = getattr(draft_kv_pool, "full_kv_pool", None)
+    has_draft_full = (
+        draft_full_pool is not None and getattr(draft_full_pool, "layer_num", 0) > 0
+    )
+    if has_draft_full:
+        full_layer_mapping, swa_layer_mapping = _swa_layer_mappings(draft_kv_pool)
+        transfer_layer_id_max = (
+            max(full_layer_mapping.keys() | swa_layer_mapping.keys()) + 1
+        )
+        draft_full_host = _build_mha_mla_host_pool(
+            pool=draft_full_pool,
+            host_to_device_ratio=host_pool_group.logical_size / draft_full_pool.size,
+            page_size=controller.page_size,
+            layout=get_memory().hicache_mem_layout,
+            allocator_type=_get_allocator_type(),
+            pool_label="draft",
+            override_page_num=_tpu_dma_override_pages(target_kv_host),
+        )
+        specs.append(
+            SidecarPoolSpec(pool_name=PoolName.DRAFT, indices_from_pool=PoolName.KV)
+        )
+        entries.append(
+            build_pool_entry(
+                name=PoolName.DRAFT,
+                host_pool=draft_full_host,
+                device_pool=draft_full_pool,
+                layer_mapping=full_layer_mapping,
+                transfer_layer_id_max=transfer_layer_id_max,
+            )
+        )
+
+    swa_uses_full = getattr(draft_kv_pool, "_swa_uses_full_indices", None) is True
+    if draft_swa_pool.layer_num == 0 or (
+        not has_target_swa_host and not swa_uses_full
+    ):
+        return specs, entries
+
+    if swa_uses_full:
+        if not has_draft_full:
+            return build_full_draft_pools(
+                draft_kv_pool=draft_swa_pool,
+                tree_cache=tree_cache,
+            )
+        host_pool = _build_mha_mla_host_pool(
+            pool=draft_swa_pool,
+            host_to_device_ratio=host_pool_group.logical_size / draft_swa_pool.size,
+            page_size=controller.page_size,
+            layout=get_memory().hicache_mem_layout,
+            allocator_type=_get_allocator_type(),
+            pool_label="draft_swa",
+            override_page_num=_tpu_dma_override_pages(target_kv_host),
+        )
+    elif isinstance(target_swa_host_pool, DeepSeekV4PagedHostPool):
         _require_single_row_dsv4_swa_pages(
             logical_page_size=target_swa_host_pool.slot_page_size,
             physical_page_size=draft_swa_pool.page_size,
@@ -1588,6 +1733,15 @@ def build_swa_draft_pools(
             allocator_type=_get_allocator_type(),
         )
     else:
+        target_kvcache = getattr(controller, "mem_pool_device", None)
+        device_translator = getattr(
+            target_kvcache, "translate_swa_pages_for_draft", None
+        )
+        host_translator = (
+            target_swa_host_pool.make_compact_swa_host_translator(target_swa_host_pool)
+            if hasattr(target_swa_host_pool, "make_compact_swa_host_translator")
+            else None
+        )
         host_pool = _build_mha_mla_host_pool(
             pool=draft_swa_pool,
             host_to_device_ratio=target_swa_host_pool.size / draft_swa_pool.size,
@@ -1595,22 +1749,36 @@ def build_swa_draft_pools(
             layout=target_swa_host_pool.layout,
             allocator_type=_get_allocator_type(),
             pool_label="draft_swa",
+            override_page_num=_tpu_dma_override_pages(target_swa_host_pool),
+            device_page_translator=device_translator,
+            host_page_translator=host_translator,
         )
 
-    layer_mapping = {i: i for i in range(draft_swa_pool.layer_num)}
-    spec = SidecarPoolSpec(
-        pool_name=PoolName.DRAFT_SWA,
-        indices_from_pool=PoolName.SWA,
-        hit_policy=PoolHitPolicy.TRAILING_PAGES,
+    if has_draft_full:
+        swa_mapping = swa_layer_mapping
+        swa_max_layer = transfer_layer_id_max
+    else:
+        swa_mapping = {i: i for i in range(draft_swa_pool.layer_num)}
+        swa_max_layer = host_pool.layer_num
+    spec = (
+        SidecarPoolSpec(pool_name=PoolName.DRAFT_SWA, indices_from_pool=PoolName.KV)
+        if swa_uses_full
+        else SidecarPoolSpec(
+            pool_name=PoolName.DRAFT_SWA,
+            indices_from_pool=PoolName.SWA,
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
     )
     entry = build_pool_entry(
         name=PoolName.DRAFT_SWA,
         host_pool=host_pool,
         device_pool=draft_swa_pool,
-        layer_mapping=layer_mapping,
-        transfer_layer_id_max=host_pool.layer_num,
+        layer_mapping=swa_mapping,
+        transfer_layer_id_max=swa_max_layer,
     )
-    return [spec], [entry]
+    specs.append(spec)
+    entries.append(entry)
+    return specs, entries
 
 
 def build_hicache_draft_sidecars(

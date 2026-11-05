@@ -72,11 +72,13 @@ class PullReq(WireMessage):
     # Window pages the decode allocated for the room; the sender registers
     # only the window blocks it will read.
     decode_swa_pages: int = 0
+    decode_draft_swa_pages: int = 0
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")
         require_non_negative(self.decode_pages, "decode_pages")
         require_non_negative(self.decode_swa_pages, "decode_swa_pages")
+        require_non_negative(self.decode_draft_swa_pages, "decode_draft_swa_pages")
         _require_port(self.decode_port)
 
 
@@ -96,6 +98,9 @@ class Blocks(WireMessage):
     # Optional opaque host state metadata (e.g., DSV4 ring shifts).
     state_meta: bytes = b""
     kv_layout: str = PER_LAYER_KV_LAYOUT
+    draft_swa_blocks: list[int] = msgspec.field(default_factory=list)
+    draft_endpoint: str = ""
+    draft_swa_endpoint: str = ""
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")
@@ -113,6 +118,7 @@ class Chunk(WireMessage):
     blocks: list[int]
     endpoint: str
     kv_layout: str = PER_LAYER_KV_LAYOUT
+    draft_endpoint: str = ""
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")
@@ -133,9 +139,16 @@ class ReshardReq(WireMessage):
     dst_attn_tp: int
     decode_swa_blocks: list[int]
     swa_push_endpoint: str
+    decode_draft_swa_blocks: list[int] = msgspec.field(default_factory=list)
+    draft_push_endpoint: str = ""
+    draft_swa_push_endpoint: str = ""
+    draft_total_kv_heads: int = 0
+    draft_swa_total_kv_heads: int = 0
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")
+        require_non_negative(self.draft_total_kv_heads, "draft_total_kv_heads")
+        require_non_negative(self.draft_swa_total_kv_heads, "draft_swa_total_kv_heads")
         _require_port(self.decode_port)
         if self.dst_attn_tp < 1:
             raise ValueError(
@@ -153,6 +166,7 @@ class ReshardBlocks(WireMessage):
     aux_blob: bytes
     prefill_swa_blocks: list[int]
     kv_layout: str = PER_LAYER_KV_LAYOUT
+    prefill_draft_swa_blocks: list[int] = msgspec.field(default_factory=list)
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")
@@ -197,11 +211,13 @@ class ReshardChunkReady(WireMessage):
     room: int
     index: int
     uuid: int
+    draft_uuid: int = 0
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")
         require_non_negative(self.index, "index")
         require_non_negative(self.uuid, "uuid")
+        require_non_negative(self.draft_uuid, "draft_uuid")
 
 
 class RoomFailed(WireMessage):

@@ -811,26 +811,39 @@ class TestTpuUnifiedSWAKVPoolWiring(unittest.TestCase):
                 kvc_spec = copy.copy(base)
                 kvc_spec.spec_algorithm = supported_spec
                 self.assertTrue(unified_kv_pool_enabled(kvc_spec))
-            # PR 6 guard: speculative drafts with KV pools reject disaggregation and HiCache
-            for spec_guard_ctx in (
+            # PR 7: speculative drafts with KV pools are supported with Raiden PD and Raiden HiCache
+            for spec_supported_ctx in (
                 dict(
                     disaggregation_mode="prefill",
                     disaggregation_transfer_backend="raiden",
+                ),
+                dict(
+                    disaggregation_mode="decode",
+                    disaggregation_transfer_backend="raiden",
+                    enable_hierarchical_cache=True,
+                    hicache_io_backend="raiden",
                 ),
                 dict(
                     enable_hierarchical_cache=True,
                     hicache_io_backend="raiden",
                 ),
             ):
-                with self._cfg_patches(**spec_guard_ctx):
+                with self._cfg_patches(**spec_supported_ctx):
                     kvc_eagle = copy.copy(base)
                     kvc_eagle.spec_algorithm = SpeculativeAlgorithm.EAGLE3
-                    with self.assertRaisesRegex(ValueError, "--enable-unified-memory"):
-                        unified_kv_pool_enabled(kvc_eagle)
-                    # NGRAM has no draft KV pool, so it remains allowed
+                    self.assertTrue(unified_kv_pool_enabled(kvc_eagle))
                     kvc_ngram = copy.copy(base)
                     kvc_ngram.spec_algorithm = SpeculativeAlgorithm.NGRAM
                     self.assertTrue(unified_kv_pool_enabled(kvc_ngram))
+            # Non-raiden disaggregation/hicache backends remain rejected with speculative drafts
+            with self._cfg_patches(
+                enable_hierarchical_cache=True,
+                hicache_io_backend="direct",
+            ):
+                kvc_eagle = copy.copy(base)
+                kvc_eagle.spec_algorithm = SpeculativeAlgorithm.EAGLE3
+                with self.assertRaises(ValueError):
+                    unified_kv_pool_enabled(kvc_eagle)
             kvc_asym = self._make_mock_kvc()
             kvc_asym.model_config.has_asymmetric_kv = True
             with self.assertRaises(ValueError):
@@ -1822,6 +1835,361 @@ class TestTpuUnifiedDMAHiCache(unittest.TestCase):
             self.assertEqual(
                 cache.host_pool_group.get_pool(PoolName.SWA).live_tokens(), 4
             )
+
+    def test_heterogeneous_spec_draft_hicache_sidecars_backup_reload_and_retraction(
+        self,
+    ):
+        from sglang.srt.mem_cache.kv_cache_builder import (
+            maybe_register_hicache_draft,
+        )
+        from sglang.srt.speculative.base_spec_worker import (
+            HiCacheDraftMode,
+            HiCacheDraftPlan,
+        )
+        from sglang_tpu.unified_kv_pool import (
+            draft_case2b_num_pages,
+            draft_case2c_swa_num_pages,
+        )
+
+        ps = 4
+        n_t = 16
+        for label in (
+            "case2a_fa_only",
+            "case2a_mtp_full_indices",
+            "case2b_m_d_le_m_t",
+            "case2b_m_d_gt_m_t",
+            "case2c_swa_only",
+            "case2c_mixed",
+        ):
+            with self.subTest(case=label):
+                self.created_engines.clear()
+                # Target: L_FA=2, L_SWA=4 -> G=2 shared buffers, M_T=2 SWA groups.
+                pool = TpuUnifiedSWAKVPool(
+                    size=n_t * ps,
+                    page_size=ps,
+                    dtype=torch.bfloat16,
+                    full=AttnLayerSpec(head_num=2, head_dim=128, layer_ids=[0, 1]),
+                    swa=AttnLayerSpec(
+                        head_num=2, head_dim=128, layer_ids=[2, 3, 4, 5]
+                    ),
+                    device="cpu",
+                )
+                req_pool = ReqToTokenPool(
+                    size=8, max_context_len=64, device="cpu", enable_memory_saver=False
+                )
+                alloc = TpuUnifiedSWATokenToKVPoolAllocator(
+                    size=n_t * ps,
+                    page_size=ps,
+                    dtype=torch.bfloat16,
+                    device="cpu",
+                    kvcache=pool,
+                    need_sort=False,
+                    req_to_token_pool=req_pool,
+                )
+                m_t = pool.layout.num_swa_groups  # 2
+
+                if label == "case2a_fa_only":
+                    draft_pool = TpuFusedMHATokenToKVPool(
+                        size=n_t * ps,
+                        page_size=ps,
+                        dtype=torch.bfloat16,
+                        head_num=1,
+                        head_dim=64,
+                        layer_num=2,
+                        device="cpu",
+                        enable_memory_saver=False,
+                    )
+                elif label == "case2a_mtp_full_indices":
+                    draft_pool = SWAKVPool(
+                        size=n_t * ps,
+                        size_swa=n_t * ps,
+                        page_size=ps,
+                        dtype=torch.bfloat16,
+                        head_num=1,
+                        head_dim=64,
+                        swa_attention_layer_ids=[0],
+                        full_attention_layer_ids=[],
+                        device="cpu",
+                        token_to_kv_pool_class=TpuFusedMHATokenToKVPool,
+                    )
+                    draft_pool._swa_uses_full_indices = True
+                elif label == "case2b_m_d_le_m_t":
+                    # L_FA=2, L_SWA=2 -> M_D=1 <= M_T=2
+                    n_d = draft_case2b_num_pages(n_t, m_t, 1)
+                    draft_pool = TpuUnifiedSWAKVPool(
+                        size=n_d * ps,
+                        page_size=ps,
+                        dtype=torch.bfloat16,
+                        full=AttnLayerSpec(head_num=1, head_dim=64, layer_ids=[0, 1]),
+                        swa=AttnLayerSpec(head_num=1, head_dim=64, layer_ids=[2, 3]),
+                        device="cpu",
+                    )
+                elif label == "case2b_m_d_gt_m_t":
+                    # L_FA=1, L_SWA=3 -> M_D=3 > M_T=2 (1 overflow group!)
+                    n_d = draft_case2b_num_pages(n_t, m_t, 3)
+                    draft_pool = TpuUnifiedSWAKVPool(
+                        size=n_d * ps,
+                        page_size=ps,
+                        dtype=torch.bfloat16,
+                        full=AttnLayerSpec(head_num=1, head_dim=64, layer_ids=[0]),
+                        swa=AttnLayerSpec(head_num=1, head_dim=64, layer_ids=[1, 2, 3]),
+                        device="cpu",
+                    )
+                elif label == "case2c_swa_only":
+                    n_d_swa = draft_case2c_swa_num_pages(n_t, m_t)
+                    draft_pool = SWAKVPool(
+                        size=n_t * ps,
+                        size_swa=n_d_swa * ps,
+                        page_size=ps,
+                        dtype=torch.bfloat16,
+                        head_num=1,
+                        head_dim=64,
+                        swa_attention_layer_ids=[0, 1],
+                        full_attention_layer_ids=[],
+                        device="cpu",
+                        token_to_kv_pool_class=TpuFusedMHATokenToKVPool,
+                    )
+                else:
+                    n_d_swa = draft_case2c_swa_num_pages(n_t, m_t)
+                    draft_pool = SWAKVPool(
+                        size=n_t * ps,
+                        size_swa=n_d_swa * ps,
+                        page_size=ps,
+                        dtype=torch.bfloat16,
+                        head_num=2,
+                        head_dim=64,
+                        swa_attention_layer_ids=[1, 2],
+                        full_attention_layer_ids=[0],
+                        device="cpu",
+                        token_to_kv_pool_class=TpuFusedMHATokenToKVPool,
+                        swa_kv_pool_kwargs=dict(
+                            page_size=ps,
+                            enable_memory_saver=False,
+                            device="cpu",
+                            head_num=1,
+                            head_dim=64,
+                        ),
+                    )
+                alloc.attach_draft_kv_pool(draft_pool)
+
+                params = CacheInitParams(
+                    req_to_token_pool=req_pool,
+                    token_to_kv_pool_allocator=alloc,
+                    page_size=ps,
+                    disable=False,
+                    sliding_window_size=ps,
+                    tree_components=(ComponentType.FULL, ComponentType.SWA),
+                    eviction_policy="lru",
+                    tree_core_backend="python",
+                )
+                plan = HiCacheDraftPlan(
+                    mode=HiCacheDraftMode.SIDECAR, device_pools=(draft_pool,)
+                )
+                with self._hicache_ctx(
+                    page_size=ps,
+                    hicache_ratio=2.0,
+                    enable_unified_memory=True,
+                ):
+                    cache = UnifiedRadixCache(params=params)
+                    server_args = ServerArgs(
+                        model_path="dummy",
+                        enable_hierarchical_cache=True,
+                        hicache_io_backend=self.BACKEND_NAME,
+                        page_size=ps,
+                    )
+                    cache.init_hicache(server_args, params)
+                    maybe_register_hicache_draft(tree_cache=cache, draft_plan=plan)
+                    cache.validate_retraction_host_capacity()
+
+                    self.assertIsInstance(draft_pool.layer_transfer_counter, BatchDoneCounter)
+                    ctrl = cache.cache_controller
+
+                    # Allocate 1 page (4 tokens) on device, stamp distinct values in Target AND Draft
+                    out = alloc.alloc_extend(
+                        prefix_lens=torch.tensor([0]),
+                        prefix_lens_cpu=torch.tensor([0]),
+                        seq_lens=torch.tensor([ps]),
+                        seq_lens_cpu=torch.tensor([ps]),
+                        last_loc=torch.tensor([-1]),
+                        extend_num_tokens=ps,
+                    )
+                    fp = int(out[0] // ps)
+                    sp = int(pool.translate_loc_from_full_to_swa(out)[0].item() // ps)
+                    pool.kv_pool.kv_buffer[0][fp].fill_(10.0)
+                    pool.kv_pool.kv_buffer[1][fp].fill_(11.0)
+                    for g in range(m_t):
+                        phys_s = sp if g == 0 else int(pool.swa_group_pages[g - 1, sp])
+                        pool.kv_pool.kv_buffer[0][phys_s].fill_(20.0 + g)
+                        pool.kv_pool.kv_buffer[1][phys_s].fill_(30.0 + g)
+
+                    if label == "case2a_fa_only":
+                        draft_pool.kv_buffer[0][fp].fill_(51.0)
+                        draft_pool.kv_buffer[1][fp].fill_(52.0)
+                    elif label == "case2a_mtp_full_indices":
+                        draft_pool.swa_kv_pool.kv_buffer[0][fp].fill_(55.0)
+                    elif label.startswith("case2b_"):
+                        m_d = draft_pool.layout.num_swa_groups
+                        for b in range(draft_pool.layout.num_shared_buffers):
+                            draft_pool.kv_pool.kv_buffer[b][fp].fill_(60.0 + b)
+                        for g in range(m_d):
+                            phys_ds = (
+                                sp
+                                if g == 0
+                                else int(draft_pool.swa_group_pages[g - 1, sp])
+                            )
+                            for b in range(draft_pool.layout.num_shared_buffers):
+                                draft_pool.kv_pool.kv_buffer[b][phys_ds].fill_(
+                                    70.0 + 10 * g + b
+                                )
+                    elif label == "case2c_swa_only":
+                        dsp = int(
+                            draft_pool.translate_loc_from_full_to_swa(out)[0].item()
+                            // ps
+                        )
+                        draft_pool.swa_kv_pool.kv_buffer[0][dsp].fill_(81.0)
+                        draft_pool.swa_kv_pool.kv_buffer[1][dsp].fill_(82.0)
+                    else:
+                        dsp = int(
+                            draft_pool.translate_loc_from_full_to_swa(out)[0].item()
+                            // ps
+                        )
+                        draft_pool.full_kv_pool.kv_buffer[0][fp].fill_(91.0)
+                        draft_pool.swa_kv_pool.kv_buffer[0][dsp].fill_(92.0)
+                        draft_pool.swa_kv_pool.kv_buffer[1][dsp].fill_(93.0)
+
+                    # Backup to L2 host, evict from device, zero ALL Target and Draft device tensors
+                    key = RadixKey(array("q", [1, 2, 3, 4]))
+                    cache.insert(InsertParams(key=key, value=out))
+                    ctrl.start_writing()
+                    cache.writing_check()
+
+                    cache.evict_for_alloc(EvictParams(num_tokens=ps, swa_num_tokens=ps))
+                    for buf in pool.kv_pool.kv_buffer:
+                        buf.zero_()
+                    if label == "case2a_fa_only":
+                        for buf in draft_pool.kv_buffer:
+                            buf.zero_()
+                    elif label.startswith("case2b_"):
+                        for buf in draft_pool.kv_pool.kv_buffer:
+                            buf.zero_()
+                    else:
+                        for buf in draft_pool.full_kv_pool.kv_buffer:
+                            buf.zero_()
+                        for buf in draft_pool.swa_kv_pool.kv_buffer:
+                            buf.zero_()
+
+                    # Allocate 1 dummy page first so reload lands on DIFFERENT physical pages!
+                    dummy = alloc.alloc_extend(
+                        prefix_lens=torch.tensor([0]),
+                        prefix_lens_cpu=torch.tensor([0]),
+                        seq_lens=torch.tensor([ps]),
+                        seq_lens_cpu=torch.tensor([ps]),
+                        last_loc=torch.tensor([-1]),
+                        extend_num_tokens=ps,
+                    )
+                    match = cache.match_prefix(MatchPrefixParams(key=key))
+                    self.assertEqual(match.host_hit_length, ps)
+                    self.assertEqual(match.swa_host_hit_length, ps)
+                    self.assertTrue(cache.load_back(match.best_match_node))
+                    ctrl.start_loading()
+                    cache.loading_check()
+
+                    reloaded = cache.match_prefix(
+                        MatchPrefixParams(key=key)
+                    ).device_indices
+                    rfp = int(reloaded[0] // ps)
+                    rsp = int(
+                        pool.translate_loc_from_full_to_swa(reloaded)[0].item() // ps
+                    )
+                    self.assertNotEqual(rfp, fp)
+                    self.assertTrue(torch.all(pool.kv_pool.kv_buffer[0][rfp] == 10.0))
+                    self.assertTrue(torch.all(pool.kv_pool.kv_buffer[1][rfp] == 11.0))
+                    for g in range(m_t):
+                        phys_s = (
+                            rsp if g == 0 else int(pool.swa_group_pages[g - 1, rsp])
+                        )
+                        self.assertTrue(
+                            torch.all(pool.kv_pool.kv_buffer[0][phys_s] == 20.0 + g)
+                        )
+                        self.assertTrue(
+                            torch.all(pool.kv_pool.kv_buffer[1][phys_s] == 30.0 + g)
+                        )
+
+                    if label == "case2a_fa_only":
+                        self.assertTrue(torch.all(draft_pool.kv_buffer[0][rfp] == 51.0))
+                        self.assertTrue(torch.all(draft_pool.kv_buffer[1][rfp] == 52.0))
+                    elif label == "case2a_mtp_full_indices":
+                        self.assertTrue(
+                            torch.all(draft_pool.swa_kv_pool.kv_buffer[0][rfp] == 55.0)
+                        )
+                    elif label.startswith("case2b_"):
+                        m_d = draft_pool.layout.num_swa_groups
+                        for b in range(draft_pool.layout.num_shared_buffers):
+                            self.assertTrue(
+                                torch.all(
+                                    draft_pool.kv_pool.kv_buffer[b][rfp] == 60.0 + b
+                                )
+                            )
+                        for g in range(m_d):
+                            phys_ds = (
+                                rsp
+                                if g == 0
+                                else int(draft_pool.swa_group_pages[g - 1, rsp])
+                            )
+                            self.assertGreater(phys_ds, 0)
+                            for b in range(draft_pool.layout.num_shared_buffers):
+                                self.assertTrue(
+                                    torch.all(
+                                        draft_pool.kv_pool.kv_buffer[b][phys_ds]
+                                        == 70.0 + 10 * g + b
+                                    )
+                                )
+                    elif label == "case2c_swa_only":
+                        rdsp = int(
+                            draft_pool.translate_loc_from_full_to_swa(reloaded)[
+                                0
+                            ].item()
+                            // ps
+                        )
+                        self.assertGreater(rdsp, 0)
+                        self.assertTrue(
+                            torch.all(draft_pool.swa_kv_pool.kv_buffer[0][rdsp] == 81.0)
+                        )
+                        self.assertTrue(
+                            torch.all(draft_pool.swa_kv_pool.kv_buffer[1][rdsp] == 82.0)
+                        )
+                    else:
+                        rdsp = int(
+                            draft_pool.translate_loc_from_full_to_swa(reloaded)[
+                                0
+                            ].item()
+                            // ps
+                        )
+                        self.assertGreater(rdsp, 0)
+                        self.assertTrue(
+                            torch.all(draft_pool.full_kv_pool.kv_buffer[0][rfp] == 91.0)
+                        )
+                        self.assertTrue(
+                            torch.all(draft_pool.swa_kv_pool.kv_buffer[0][rdsp] == 92.0)
+                        )
+                        self.assertTrue(
+                            torch.all(draft_pool.swa_kv_pool.kv_buffer[1][rdsp] == 93.0)
+                        )
+
+                    # Verify host clear/free returns all overflow host pages on M_D > M_T!
+                    alloc.free_swa(dummy)
+                    alloc.free_full(dummy)
+                    cache.reset()
+                    if label == "case2b_m_d_gt_m_t":
+                        target_swa_host = cache.host_pool_group.get_pool(PoolName.SWA)
+                        draft_swa_host = cache.host_pool_group.get_pool(
+                            PoolName.DRAFT_SWA
+                        )
+                        self.assertEqual(
+                            len(draft_swa_host._overflow_free_pages),
+                            draft_swa_host._state.page_num
+                            - target_swa_host._state.page_num,
+                        )
 
     def test_hooks_register_installs_unified_hicache_strategy_on_tpu_only(self):
         saved_strategies = list(hybrid_pool_assembler._STRATEGIES)

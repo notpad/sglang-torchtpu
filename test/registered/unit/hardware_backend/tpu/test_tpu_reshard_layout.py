@@ -40,6 +40,55 @@ class TestTpuReshardLayout(unittest.TestCase):
                 with self.subTest(total_heads=total_heads, swa=swa):
                     self._check_layout(torch.bfloat16, total_heads, swa=swa)
 
+    def test_fp8_and_heterogeneous_draft_writer_ranges(self):
+        for total_heads in (16, 32):
+            for swa in (False, True):
+                with self.subTest(dtype="fp8", total_heads=total_heads, swa=swa):
+                    self._check_layout(torch.float8_e4m3fn, total_heads, swa=swa)
+        for partial_heads in (4, 8):
+            with self.subTest(dtype="fp8_partial_pack", total_heads=partial_heads):
+                with self.assertRaisesRegex(ValueError, "Partial FP8 head packs"):
+                    self._check_layout(torch.float8_e4m3fn, partial_heads)
+
+        # Mixed target (fp8, 32 total heads) + draft (bf16, 8 full heads, 4 SWA heads)
+        src_tp, dst_tp = 8, 4
+        mgr = object.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
+        mgr._kv_caches = [_layer(torch.float8_e4m3fn, 32 // dst_tp)]
+        mgr._swa_kv_caches = []
+        mgr._draft_kv_caches = [_layer(torch.bfloat16, 8 // dst_tp)]
+        mgr._draft_swa_kv_caches = [_layer(torch.bfloat16, max(1, 4 // dst_tp))]
+        mgr._draft_total_kv_head_num = 8
+        mgr._draft_swa_total_kv_head_num = 4
+        mgr.kv_args = SimpleNamespace(total_kv_head_num=32)
+
+        for swa, total_h, dst_buf in (
+            (False, 8, mgr._draft_kv_caches[0]),
+            (True, 4, mgr._draft_swa_kv_caches[0]),
+        ):
+            with self.subTest(draft=True, swa=swa):
+                src_buf = _layer(torch.bfloat16, max(1, total_h // src_tp))
+                geom = mgr._make_geometry(src_tp, dst_tp, swa=swa, draft=True)
+                src_w = src_buf.stride(1) * src_buf.element_size()
+                dst_w = dst_buf.stride(1) * dst_buf.element_size()
+                for dst_rank in range(dst_tp):
+                    written = set()
+                    writers = (
+                        [dst_rank * 2]
+                        if total_h < src_tp
+                        else [dst_rank * 2, dst_rank * 2 + 1]
+                    )
+                    for src_rank in writers:
+                        s_off, sz, s_str, d_off, d_str = geom.entry_bytes(
+                            src_rank, dst_rank
+                        )
+                        self.assertEqual(s_str, src_w)
+                        self.assertEqual(d_str, dst_w)
+                        self.assertLessEqual(s_off + sz, src_w)
+                        self.assertLessEqual(d_off + sz, dst_w)
+                        written.update(range(d_off, d_off + sz))
+                    self.assertEqual(written, set(range(dst_w)))
+
     def _check_layout(self, dtype, total_heads, *, swa=False):
         src_tp, dst_tp = 8, 4
         source = _layer(dtype, max(1, total_heads // src_tp))

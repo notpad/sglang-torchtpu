@@ -13,6 +13,7 @@ from __future__ import annotations
 import inspect
 import logging
 import math
+import weakref
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -262,7 +263,6 @@ def _unsupported_reason(kvc) -> Optional[str]:
     disagg_backend = getattr(disagg, "disaggregation_transfer_backend", None)
     pool_cls = kvc._tpu_mha_pool_class()
     spec_algo = kvc.spec_algorithm
-    has_draft_kv = _has_draft_kv_pool(spec_algo)
     checks = (
         (not kvc.is_hybrid_swa, "requires a hybrid SWA model."),
         (kvc.use_mla_backend, "does not support MLA models."),
@@ -283,14 +283,6 @@ def _unsupported_reason(kvc) -> Optional[str]:
         (
             not _is_supported_spec_algorithm(spec_algo),
             f"does not support speculative_algorithm={getattr(spec_algo, 'name', spec_algo)!r}.",
-        ),
-        (
-            has_draft_kv and disagg_mode != "null",
-            "with speculative decoding does not support PD disaggregation yet.",
-        ),
-        (
-            has_draft_kv and memory.enable_hierarchical_cache,
-            "with speculative decoding does not support --enable-hierarchical-cache yet.",
         ),
         (
             parallel.pp_size > 1 or kvc.pp_size > 1,
@@ -516,6 +508,9 @@ class TpuUnifiedSWAKVPool(BaseSWAKVPool):
             self._swa_layer_group[gid] = j // G
 
         self.full_to_swa_index_mapping: Optional[torch.Tensor] = None
+        self._allocator_ref: Optional[
+            weakref.ReferenceType[TpuUnifiedSWATokenToKVPoolAllocator]
+        ] = None
         k_size, v_size = self.get_kv_size_bytes()
         self.mem_usage = (k_size + v_size) / GB
         logger.info(
@@ -584,6 +579,16 @@ class TpuUnifiedSWAKVPool(BaseSWAKVPool):
         companions = self.swa_group_pages[:, base].to(torch.long)
         expanded = torch.cat([base.unsqueeze(0), companions], dim=0)
         return expanded.T.reshape(-1).tolist()
+
+    def translate_swa_pages_for_draft(self, page_ids: Sequence[int]) -> List[int]:
+        """Translate target base SWA page IDs to Case 2c compact draft SWA page IDs."""
+        if not page_ids:
+            return []
+        alloc = self._allocator_ref() if self._allocator_ref is not None else None
+        if alloc is None or alloc.target_swa_to_draft_swa is None:
+            return [int(x) for x in page_ids]
+        pages = torch.as_tensor(page_ids, dtype=torch.int64)
+        return alloc.translate_target_swa_pages_to_draft(pages).tolist()
 
     def _map_swa_group_indices(
         self, group: int, swa_indices_cpu: torch.Tensor
@@ -831,6 +836,7 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self._swa_groups = kvcache.layout.num_swa_groups
         self.need_sort = need_sort
         self._kvcache = kvcache
+        kvcache._allocator_ref = weakref.ref(self)
         self._req_to_token_pool = req_to_token_pool
         self.draft_kv_pool: Optional[KVCache] = None
         self.draft_kv_pools: list[KVCache] = []
@@ -958,6 +964,7 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.draft_kv_pools.append(draft_pool)
 
         if draft_swa_full_capacity:
+            draft_pool._swa_uses_full_indices = True
             n = self.size_full + self.page_size
             identity_mapping = torch.arange(
                 n + 1,
